@@ -64,12 +64,12 @@
     }
   },
   "devDependencies": {
-    "@nuxt/kit": "^4.4.8",
+    "@nuxt/kit": "^4.5.2",
     "@types/node": "^25.0.3",
-    "tsdown": "^0.22.2",
+    "tsdown": "^0.23.0",
     "typescript": "^5.7.2",
-    "vue": "^3.5.13",
-    "vue-tsc": "^3.3.2"
+    "vue": "^3.5.42",
+    "vue-tsc": "^3.3.11"
   },
   "repository": {
     "type": "git",

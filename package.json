@@ -73,18 +73,18 @@
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
-    "@typescript-eslint/eslint-plugin": "^8.64.0",
+    "@typescript-eslint/eslint-plugin": "^8.69.0",
     "@typescript-eslint/parser": "^8.64.0",
-    "@vue/test-utils": "^2.4.10",
-    "esbuild": "0.28.1",
-    "eslint": "^10.7.0",
-    "eslint-plugin-vue": "^10.9.2",
-    "globals": "^17.7.0",
+    "@vue/test-utils": "^2.5.0",
+    "esbuild": "0.28.2",
+    "eslint": "^10.9.1",
+    "eslint-plugin-vue": "^10.10.0",
+    "globals": "^17.12.0",
     "js-beautify": "^2.0.3",
     "next": "^15.5.21",
-    "postcss": "^8.5.23",
-    "sharp": "^0.35.3",
-    "vite": "8.0.16",
+    "postcss": "^8.5.28",
+    "sharp": "^0.35.4",
+    "vite": "8.2.2",
     "vue-eslint-parser": "^10.4.1"
   }
 }

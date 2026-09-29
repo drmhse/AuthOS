@@ -14,16 +14,16 @@
   },
   "dependencies": {
     "@drmhse/sso-sdk": "*",
-    "@lucide/vue": "^1.16.0",
+    "@lucide/vue": "^1.48.0",
     "pinia": "^3.0.3",
-    "vue": "^3.5.22",
+    "vue": "^3.5.43",
     "vue-router": "^4.5.1"
   },
   "devDependencies": {
-    "@vitejs/plugin-vue": "^6.0.1",
+    "@vitejs/plugin-vue": "^6.0.9",
     "jsdom": "^29.1.1",
-    "vite": "^8.0.16",
+    "vite": "^8.3.1",
     "vitest": "^4.1.11",
-    "vue-tsc": "^3.3.2"
+    "vue-tsc": "^3.3.11"
   }
 }

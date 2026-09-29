@@ -81,9 +81,9 @@
     "eslint-plugin-vue": "^10.9.2",
     "globals": "^17.7.0",
     "js-beautify": "^2.0.3",
-    "next": "^15.5.21",
+    "next": "^15.5.26",
     "postcss": "^8.5.23",
-    "sharp": "^0.35.3",
+    "sharp": "^0.35.5",
     "vite": "8.0.16",
     "vue-eslint-parser": "^10.4.1"
   }

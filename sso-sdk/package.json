@@ -48,7 +48,7 @@
   "devDependencies": {
     "@types/node": "^20.11.5",
     "tsdown": "^0.22.2",
-    "typescript": "^5.3.3"
+    "typescript": "^7.0.2"
   },
   "repository": {
     "type": "git",

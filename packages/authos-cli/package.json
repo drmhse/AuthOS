@@ -41,7 +41,7 @@
     "@types/node": "^22.10.2",
     "@types/prompts": "^2.4.9",
     "tsdown": "^0.22.2",
-    "typescript": "^5.7.2"
+    "typescript": "^7.0.2"
   },
   "repository": {
     "type": "git",

@@ -37,24 +37,6 @@ updates:
           - minor
           - patch
 
-  - package-ecosystem: cargo
-    directory: /api/migration
-    schedule:
-      interval: weekly
-      day: monday
-      time: '06:45'
-      timezone: Africa/Nairobi
-    open-pull-requests-limit: 4
-    commit-message:
-      prefix: deps(migration)
-    groups:
-      migration-minor-and-patch:
-        patterns:
-          - '*'
-        update-types:
-          - minor
-          - patch
-
   - package-ecosystem: github-actions
     directory: /
     schedule:

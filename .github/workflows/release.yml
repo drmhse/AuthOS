@@ -157,7 +157,6 @@ jobs:
       - name: Audit Rust dependencies
         run: |
           cargo audit --file api/Cargo.lock
-          cargo audit --file api/migration/Cargo.lock
 
       - name: Check Rust formatting
         working-directory: api

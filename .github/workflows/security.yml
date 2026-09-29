@@ -73,9 +73,6 @@ jobs:
       - name: Audit API dependencies
         run: cargo audit --file api/Cargo.lock
 
-      - name: Audit migration dependencies
-        run: cargo audit --file api/migration/Cargo.lock
-
   codeql:
     name: CodeQL (JavaScript and TypeScript)
     runs-on: ubuntu-latest

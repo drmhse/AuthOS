@@ -7,6 +7,29 @@ project is pre-1.0; breaking changes are called out explicitly when known.
 
 No changes yet.
 
+## 0.8.13 - 2026-09-29
+
+### Security
+
+- `rustls` 0.23.35 to 0.23.45 for RUSTSEC-2026-0285: TLS 1.3 handshake
+  messages were accepted across encryption-level boundaries. `rustls` is linked
+  into every shipped binary and image, for outbound HTTP and database TLS.
+  `aws-lc-rs` and `rustls-webpki` move with it.
+- Development and peer-test dependencies clear their advisories: `next`
+  15.5.26 (GHSA-p293-qw3h-jr36, GHSA-2xp9-vwfh-vxw4), `sharp` 0.35.5,
+  `vitest` 4.1.11, `undici` 7.30.0, and `qs` 6.16.0 via `express` 4.22.3 —
+  the `qs` fix the 0.8.12 entry was waiting for. None of these ship in a
+  published package; `npm audit` over the full tree now reports nothing.
+
+### Fixed
+
+- The weekly security scan passes again. It had failed since 2026-09-07,
+  first on npm advisories and then on `rustls`.
+- `api/migration/Cargo.lock` is removed. The migration crate has been a
+  workspace member since 0.8.9, so cargo ignored that lockfile, yet the
+  security, release, and npm-publish gates still audited it and Dependabot
+  still tried to update it. It is now covered by `api/Cargo.lock`.
+
 ## 0.8.12 - 2026-09-06
 
 ### Fixed

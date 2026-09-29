@@ -4,7 +4,7 @@ AuthOS uses one public release identity for coordinated artifacts: an annotated
 Git tag in the exact form `vMAJOR.MINOR.PATCH`. Prerelease and build
 metadata tags are rejected because the current publication path advances npm,
 GitHub, and Docker `latest` pointers. The latest published release at this
-document's baseline is `v0.8.12`.
+document's baseline is `v0.8.13`.
 
 ## Version sources
 

@@ -69,7 +69,7 @@ function check(fixtureRoot) {
 test('trust gate accepts the aligned release and database pins', () => {
   const fixtureRoot = fixture();
   try {
-    assert.match(check(fixtureRoot), /release v0\.8\.12/);
+    assert.match(check(fixtureRoot), /release v0\.8\.13/);
   } finally {
     fs.rmSync(fixtureRoot, { recursive: true, force: true });
   }
@@ -81,11 +81,11 @@ test('trust gate rejects a stale AuthOS Compose pin', () => {
     const composePath = path.join(fixtureRoot, 'api/docker-compose.sqlite.yml');
     fs.writeFileSync(
       composePath,
-      fs.readFileSync(composePath, 'utf8').replace('sqlite-v0.8.12', 'sqlite-v0.8.11'),
+      fs.readFileSync(composePath, 'utf8').replace('sqlite-v0.8.13', 'sqlite-v0.8.12'),
     );
     assert.throws(
       () => check(fixtureRoot),
-      (error) => error?.status === 1 && /does not pin editoredit\/sso:sqlite-v0\.8\.12/.test(error.stderr),
+      (error) => error?.status === 1 && /does not pin editoredit\/sso:sqlite-v0\.8\.13/.test(error.stderr),
     );
   } finally {
     fs.rmSync(fixtureRoot, { recursive: true, force: true });

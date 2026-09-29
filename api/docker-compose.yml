@@ -122,7 +122,7 @@ services:
   # --------------------------------------------------------------------------
   sso:
     <<: *common-app
-    image: editoredit/sso:sqlite-v0.8.12  # SQLite is the default
+    image: editoredit/sso:sqlite-v0.8.13  # SQLite is the default
     container_name: sso-sqlite
     profiles: ["", "sqlite"]  # Runs by default (empty profile) or with --profile sqlite
     environment:
@@ -147,7 +147,7 @@ services:
   # --------------------------------------------------------------------------
   sso-postgres:
     <<: *common-app
-    image: editoredit/sso:psql-v0.8.12
+    image: editoredit/sso:psql-v0.8.13
     container_name: sso-postgres
     profiles: ["postgres"]
     environment:
@@ -189,7 +189,7 @@ services:
   # --------------------------------------------------------------------------
   sso-mysql:
     <<: *common-app
-    image: editoredit/sso:mysql-v0.8.12
+    image: editoredit/sso:mysql-v0.8.13
     container_name: sso-mysql
     profiles: ["mysql"]
     environment:

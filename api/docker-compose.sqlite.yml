@@ -73,7 +73,7 @@ x-common-app: &common-app
 services:
   sso:
     <<: *common-app
-    image: editoredit/sso:sqlite-v0.8.12
+    image: editoredit/sso:sqlite-v0.8.13
     environment:
       <<: *common-env
       DATABASE_URL: ${DATABASE_URL:-sqlite:/app/data/data.db}

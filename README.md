@@ -29,7 +29,7 @@ bootstrap link.
 To install a specific release:
 
 ```bash
-AUTHOS_VERSION=v0.8.12
+AUTHOS_VERSION=v0.8.13
 curl -fsSL -o install.sh "https://github.com/drmhse/AuthOS/releases/download/${AUTHOS_VERSION}/install.sh"
 chmod +x install.sh
 sudo AUTHOS_RELEASE_TAG="${AUTHOS_VERSION}" ./install.sh

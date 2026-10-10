@@ -58,6 +58,8 @@
     "@vue/test-utils": {
       "js-beautify": "$js-beautify"
     },
+    "vue": "^3.5.43",
+    "@vue/server-renderer": "^3.5.43",
     "next": {
       "postcss": "$postcss",
       "sharp": "$sharp"

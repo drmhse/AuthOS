@@ -30,6 +30,7 @@ import {
   AccountSecurityUrlParams,
   AuthContextRequest,
   AuthContextResponse,
+  AvailabilityResponse,
 } from '../types';
 
 /**

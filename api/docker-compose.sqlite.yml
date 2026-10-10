@@ -73,7 +73,7 @@ x-common-app: &common-app
 services:
   sso:
     <<: *common-app
-    image: editoredit/sso:${SSO_IMAGE_TAG:-sqlite-0.8.12}
+    image: ${SSO_SQLITE_IMAGE:-editoredit/sso:sqlite-v0.8.13}
     environment:
       <<: *common-env
       DATABASE_URL: ${DATABASE_URL:-sqlite:/app/data/data.db}

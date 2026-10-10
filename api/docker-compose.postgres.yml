@@ -75,7 +75,7 @@ x-common-app: &common-app
 services:
   sso:
     <<: *common-app
-    image: editoredit/sso:${SSO_PSQL_IMAGE_TAG:-psql-0.8.12}
+    image: ${SSO_PSQL_IMAGE:-editoredit/sso:psql-v0.8.13}
     container_name: sso-postgres
     environment:
       <<: *common-env

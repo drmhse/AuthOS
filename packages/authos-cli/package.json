@@ -40,7 +40,7 @@
   "devDependencies": {
     "@types/node": "^22.10.2",
     "@types/prompts": "^2.4.9",
-    "tsdown": "^0.22.2",
+    "tsdown": "^0.23.0",
     "typescript": "^5.7.2"
   },
   "repository": {

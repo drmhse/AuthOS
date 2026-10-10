@@ -14,6 +14,7 @@ async function provisionResources(root, config, material) {
 
   for (const service of config.services) {
     const organizationStatus = await ensureOrganization(client, service.org, service.orgName);
+    const adminInvite = await ensureOrgAdminInvite(client, service, config.platformOwner.email);
     const serviceResult = await ensureService(client, service);
     const providerCredentials = await ensureOAuthCredentials(client, service);
     const apiKeys = [];
@@ -23,6 +24,7 @@ async function provisionResources(root, config, material) {
     report.push({
       org: service.org,
       organizationStatus,
+      adminInvite,
       service: service.service,
       serviceStatus: serviceResult.status,
       clientId: serviceResult.clientId,
@@ -105,6 +107,25 @@ async function ensureOrganization(client, orgSlug, orgName) {
   }
 
   return status;
+}
+
+/// The platform owner is a global identity, but service sign-in needs an
+/// org membership: invite them as admin when they have neither (A6). The
+/// invite is idempotent (already-member / already-sent are fine), and the
+/// summary tells the owner where to accept it.
+async function ensureOrgAdminInvite(client, service, ownerEmail) {
+  if (!ownerEmail) return 'skipped (no platform owner email)';
+  try {
+    await client.request(
+      `/api/organizations/${encodeURIComponent(service.org)}/invitations`,
+      { method: 'POST', body: { email: ownerEmail, role: 'admin' } },
+    );
+    return 'invited';
+  } catch (error) {
+    const message = error instanceof HttpError ? `${error.status} ${error.message}` : `${error}`;
+    if (/already a member|already sent/i.test(message)) return 'existing';
+    return `failed: ${message}`;
+  }
 }
 
 async function ensureService(client, service) {

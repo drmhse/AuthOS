@@ -52,7 +52,12 @@ onMounted(async () => {
       );
     }
     message.value = 'Email verified. Redirecting to sign in...';
-    setTimeout(() => router.push(authRouteWithContext(route, '/')), 1400);
+    // Carry the flow context (org/service/redirect/state) plus a verified
+    // flag, so the login page can confirm and complete the round trip (A8).
+    setTimeout(
+      () => router.push(authRouteWithContext(route, '/', { verified: '1' })),
+      1400,
+    );
   } catch (error) {
     errorMessage.value = error.message || 'Email verification failed.';
   } finally {

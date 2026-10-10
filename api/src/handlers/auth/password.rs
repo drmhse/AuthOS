@@ -605,6 +605,36 @@ pub async fn login(
     // - Password verification failed, OR
     // - We were using dummy hash (user doesn't exist or has no password)
     if !is_valid || is_dummy {
+        // With an org context and a correct password, say so: the account
+        // exists globally but has no identity in this organization (A6).
+        // This reveals nothing without the password — the verification
+        // above costs the same as a real login either way.
+        if let Some(ref slug) = req.org_slug {
+            if let Ok(Some(global)) = UserStore::find_by_email_with_context(
+                DB::Conn(&state.db),
+                &req.email,
+                None,
+            )
+            .await
+            {
+                if global.deleted_at.is_none() {
+                    if let Some(hash) = global.password_hash.as_ref() {
+                        if crate::crypto::concurrency::verify_password_bounded(
+                            req.password.clone(),
+                            hash.clone(),
+                        )
+                        .await
+                        .unwrap_or(false)
+                        {
+                            return Err(AppError::Unauthorized(format!(
+                                "No account for this email address in organization '{}'",
+                                slug
+                            )));
+                        }
+                    }
+                }
+            }
+        }
         return Err(AppError::Unauthorized(GENERIC_LOGIN_FAILURE.to_string()));
     }
 
@@ -1243,6 +1273,25 @@ pub async fn reset_password(
         message: "Password has been reset successfully. Please log in with your new password."
             .to_string(),
     }))
+}
+
+/// GET /api/auth/availability - which email-dependent flows this instance
+/// can actually complete, so clients disable them up front instead of
+/// failing after submit (A7).
+pub async fn availability(State(state): State<AppState>) -> Json<AvailabilityResponse> {
+    let email = state.email_service.is_some();
+    Json(AvailabilityResponse {
+        password_registration: email,
+        magic_link: email,
+        password_reset: email,
+    })
+}
+
+#[derive(Debug, Serialize)]
+pub struct AvailabilityResponse {
+    pub password_registration: bool,
+    pub magic_link: bool,
+    pub password_reset: bool,
 }
 
 /// POST /api/auth/resend-verification - Resend verification email

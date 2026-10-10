@@ -12,23 +12,26 @@
 
       <div v-if="message" class="alert alert-success">{{ message }}</div>
       <div v-if="errorMessage" class="alert alert-error">{{ errorMessage }}</div>
+      <div v-if="registrationOpen === false" class="alert alert-warning">
+        Registration is unavailable: this server can't send email yet. Ask your administrator to configure SMTP.
+      </div>
 
       <div class="field">
         <label for="email">Email address</label>
-        <input id="email" v-model="email" type="email" class="input input-lg" placeholder="name@company.com" />
+        <input id="email" v-model="email" type="email" class="input input-lg" placeholder="name@company.com" :disabled="registrationOpen === false" />
       </div>
 
       <div class="field">
         <label for="password">Password</label>
-        <input id="password" v-model="password" type="password" class="input input-lg" placeholder="Minimum 8 characters" />
+        <input id="password" v-model="password" type="password" class="input input-lg" placeholder="Minimum 8 characters" :disabled="registrationOpen === false" />
       </div>
 
       <div class="field">
         <label for="confirm-password">Confirm password</label>
-        <input id="confirm-password" v-model="confirmPassword" type="password" class="input input-lg" placeholder="Repeat your password" />
+        <input id="confirm-password" v-model="confirmPassword" type="password" class="input input-lg" placeholder="Repeat your password" :disabled="registrationOpen === false" />
       </div>
 
-      <BaseButton :loading="loading" block @click="handlePasswordRegister">Create account</BaseButton>
+      <BaseButton :loading="loading" :disabled="registrationOpen === false" block @click="handlePasswordRegister">Create account</BaseButton>
 
       <p class="muted auth-centered-copy">
         Already have an account?
@@ -39,7 +42,7 @@
 </template>
 
 <script setup>
-import { ref } from 'vue';
+import { onMounted, ref } from 'vue';
 import { useRoute } from 'vue-router';
 import AuthShell from '@/components/AuthShell.vue';
 import BaseButton from '@/components/BaseButton.vue';
@@ -53,6 +56,18 @@ const confirmPassword = ref('');
 const loading = ref(false);
 const message = ref('');
 const errorMessage = ref('');
+// Null while probing; false disables the form up front instead of
+// failing after submit when SMTP isn't configured (A7).
+const registrationOpen = ref(null);
+
+onMounted(async () => {
+  try {
+    const status = await sso.auth.availability();
+    registrationOpen.value = status?.password_registration !== false;
+  } catch {
+    registrationOpen.value = true;
+  }
+});
 
 function handleOAuthRegister(provider) {
   const ctx = getAuthFlowContext(route);
@@ -68,6 +83,10 @@ function handleOAuthRegister(provider) {
 }
 
 async function handlePasswordRegister() {
+  if (registrationOpen.value === false) {
+    errorMessage.value = 'Registration is unavailable: this server cannot send email yet.';
+    return;
+  }
   if (!email.value || password.value.length < 8 || password.value !== confirmPassword.value) {
     errorMessage.value = 'Enter a valid email and matching passwords with at least 8 characters.';
     return;

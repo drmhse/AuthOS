@@ -302,6 +302,12 @@ select.input:focus {
   border-color: rgba(201, 115, 0, 0.18);
 }
 
+.alert-info {
+  background: var(--surface-muted);
+  color: var(--text);
+  border-color: var(--border-strong);
+}
+
 .status-pill,
 .status-chip {
   display: inline-flex;

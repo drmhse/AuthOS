@@ -30,7 +30,7 @@ export function hasServiceAuthContext(route) {
   return getAuthFlowContext(route).isServiceFlow;
 }
 
-export function authRouteWithContext(route, path) {
+export function authRouteWithContext(route, path, extra = {}) {
   const ctx = getAuthFlowContext(route);
   const params = new URLSearchParams();
 
@@ -40,6 +40,11 @@ export function authRouteWithContext(route, path) {
   if (ctx.redirect) params.set('redirect', ctx.redirect);
   if (ctx.returnTo) params.set('return_to', ctx.returnTo);
   if (ctx.state) params.set('state', ctx.state);
+  for (const [key, value] of Object.entries(extra)) {
+    if (value !== undefined && value !== null && value !== '') {
+      params.set(key, String(value));
+    }
+  }
 
   const query = params.toString();
   return query ? `${path}?${query}` : path;

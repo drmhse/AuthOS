@@ -399,6 +399,15 @@ export class AuthModule {
   }
 
   /**
+   * Which email-dependent flows this instance can complete, so clients
+   * disable them up front instead of failing after submit.
+   */
+  public async availability(): Promise<AvailabilityResponse> {
+    const response = await this.http.get<AvailabilityResponse>('/api/auth/availability');
+    return response.data;
+  }
+
+  /**
    * Verify an email address using the token from the verification email.
    *
    * @param token Verification token

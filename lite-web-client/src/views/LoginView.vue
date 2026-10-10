@@ -4,6 +4,9 @@
       <div v-if="accountSecurityRedirect" class="alert alert-warning">
         Sign in to manage authenticator apps, backup codes, and passkeys.
       </div>
+      <div v-if="justVerified" class="alert alert-success">
+        Email verified — sign in to continue.
+      </div>
 
       <LiteLoginForm />
 
@@ -27,6 +30,7 @@ import LiteLoginForm from '@/components/LiteLoginForm.vue';
 import { authRouteWithContext } from '@/utils/authFlowContext';
 
 const route = useRoute();
+const justVerified = computed(() => route.query.verified === '1');
 const accountSecurityRedirect = computed(() => {
   const redirect = Array.isArray(route.query.redirect) ? route.query.redirect[0] : route.query.redirect;
   return typeof redirect === 'string' && (

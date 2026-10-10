@@ -30,7 +30,8 @@ pub use session::{logout, refresh_token, revoke_token};
 
 // Password authentication handlers
 pub use password::{
-    forgot_password, login, register, resend_verification, reset_password, verify_email,
+    availability, forgot_password, login, register, resend_verification, reset_password,
+    verify_email,
 };
 
 // MFA handlers

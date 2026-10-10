@@ -148,7 +148,9 @@ function databaseUrl(config, material, container) {
     const port = container ? 3306 : Number(db.mysqlHostPort || 3307);
     return `mysql://${db.mysqlUser || 'authos'}:${material.database.mysqlPassword}@${host}:${port}/${db.mysqlDatabase || 'authos'}`;
   }
-  return container ? 'sqlite:/app/data/data.db' : 'sqlite:./data/data.db';
+  // `?mode=rwc`: a first host run must create the database file instead
+  // of failing with "unable to open database file" (A5).
+  return container ? 'sqlite:/app/data/data.db?mode=rwc' : 'sqlite:./data/data.db?mode=rwc';
 }
 
 async function writeEnv(filePath, values) {

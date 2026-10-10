@@ -2,7 +2,7 @@
   <div class="stack">
     <div v-if="statusMessage" class="alert" :class="statusClass">{{ statusMessage }}</div>
 
-    <div v-if="authContext.isServiceFlow" class="alert alert-warning">
+    <div v-if="authContext.isServiceFlow" class="alert" :class="redirectInvalid ? 'alert-warning' : 'alert-info'">
       Signing in to {{ serviceDisplayName }} for {{ orgDisplayName }}.
       <span v-if="redirectInvalid"> This request has an unregistered return URL.</span>
     </div>

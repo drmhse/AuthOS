@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { getAuthFlowContext, getDirectMfaChallenge, hasServiceAuthContext } from '@/utils/authFlowContext';
+import { authRouteWithContext, getAuthFlowContext, getDirectMfaChallenge, hasServiceAuthContext } from '@/utils/authFlowContext';
 
 describe('auth flow context helpers', () => {
   it('detects service-auth query context on hosted entry routes', () => {
@@ -22,6 +22,23 @@ describe('auth flow context helpers', () => {
       state: 'caller-state',
       isServiceFlow: true,
     });
+  });
+
+  it('carries the full flow context plus extras across hops', () => {
+    const route = {
+      query: {
+        org: 'lab',
+        service: 'servos',
+        redirect_uri: 'http://localhost:18081/cb',
+        state: 'caller-state',
+      },
+    };
+    const next = authRouteWithContext(route, '/', { verified: '1' });
+    expect(next).toContain('org=lab');
+    expect(next).toContain('service=servos');
+    expect(next).toContain('redirect_uri=');
+    expect(next).toContain('state=caller-state');
+    expect(next).toContain('verified=1');
   });
 
   it('does not treat platform routes as service-auth context', () => {

@@ -242,6 +242,15 @@ export interface RegisterResponse {
 }
 
 /**
+ * Which email-dependent flows this instance can complete.
+ */
+export interface AvailabilityResponse {
+  password_registration: boolean;
+  magic_link: boolean;
+  password_reset: boolean;
+}
+
+/**
  * Login request payload
  */
 export interface LoginRequest {

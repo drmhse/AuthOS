@@ -130,17 +130,24 @@ pub async fn get_auth_context(
     State(state): State<AppState>,
     Query(query): Query<AuthContextQuery>,
 ) -> Result<Json<AuthContextResponse>> {
-    let mut available_providers = vec![
-        "github".to_string(),
-        "google".to_string(),
-        "microsoft".to_string(),
-    ];
+    // Only configured providers and methods are advertised: showing
+    // GitHub/Google/Microsoft buttons or magic-link when nothing is
+    // configured behind them is a dead end (A9).
+    let email_configured = state.email_service.is_some();
+    let mut auth_methods = vec!["password".to_string(), "passkey".to_string()];
+    if email_configured {
+        auth_methods.insert(1, "magic_link".to_string());
+    }
 
-    let mut auth_methods = vec![
-        "password".to_string(),
-        "magic_link".to_string(),
-        "passkey".to_string(),
-    ];
+    let platform_providers = [
+        ("github", state.config.platform_github_client_id.as_ref()),
+        ("google", state.config.platform_google_client_id.as_ref()),
+        ("microsoft", state.config.platform_microsoft_client_id.as_ref()),
+    ]
+    .into_iter()
+    .filter(|(_, id)| id.as_ref().is_some_and(|id| !id.trim().is_empty()))
+    .map(|(name, _)| name.to_string())
+    .collect::<Vec<_>>();
 
     let Some(org_slug) = query
         .org
@@ -151,7 +158,7 @@ pub async fn get_auth_context(
         return Ok(Json(AuthContextResponse {
             organization: None,
             service: None,
-            available_providers,
+            available_providers: platform_providers,
             auth_methods,
             support_available: true,
         }));
@@ -161,12 +168,11 @@ pub async fn get_auth_context(
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
-    let org_provider_list = OrganizationStore::list_oauth_providers(DB::Conn(&state.db), &org.id)
+    // An org with no providers configured gets no buttons — not the
+    // platform fallback (A9).
+    let mut available_providers = OrganizationStore::list_oauth_providers(DB::Conn(&state.db), &org.id)
         .await
         .unwrap_or_default();
-    if !org_provider_list.is_empty() {
-        available_providers = org_provider_list;
-    }
 
     let service = if let Some(service_slug) = query
         .service

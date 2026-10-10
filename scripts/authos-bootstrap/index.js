@@ -101,7 +101,7 @@ function renderSummary(configPath, config, paths, material, provisionReport) {
   console.log('\nProvisioned resources:');
   for (const item of provisionReport) {
     console.log(
-      `- ${item.org}/${item.service}: org=${item.organizationStatus}, service=${item.serviceStatus}, client=${item.clientId || '(none)'}`,
+      `- ${item.org}/${item.service}: org=${item.organizationStatus}, admin=${item.adminInvite}, service=${item.serviceStatus}, client=${item.clientId || '(none)'}`,
     );
     for (const key of item.apiKeys) {
       console.log(`  api key ${key.name}: ${key.status}${key.writtenTo ? ` -> ${key.writtenTo}` : ''}`);

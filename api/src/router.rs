@@ -631,6 +631,7 @@ pub fn auth_routes(config: &Config) -> Router<AppState> {
         .route("/auth/admin/:provider/callback", get(auth_admin_callback))
         // Password authentication routes
         .route("/api/auth/register", post(register))
+        .route("/api/auth/availability", get(availability))
         .route("/auth/verify-email", get(verify_email))
         .route("/api/auth/login", post(login))
         .route("/api/auth/forgot-password", post(forgot_password))

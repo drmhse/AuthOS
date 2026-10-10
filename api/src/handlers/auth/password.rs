@@ -610,12 +610,8 @@ pub async fn login(
         // This reveals nothing without the password — the verification
         // above costs the same as a real login either way.
         if let Some(ref slug) = req.org_slug {
-            if let Ok(Some(global)) = UserStore::find_by_email_with_context(
-                DB::Conn(&state.db),
-                &req.email,
-                None,
-            )
-            .await
+            if let Ok(Some(global)) =
+                UserStore::find_by_email_with_context(DB::Conn(&state.db), &req.email, None).await
             {
                 if global.deleted_at.is_none() {
                     if let Some(hash) = global.password_hash.as_ref() {

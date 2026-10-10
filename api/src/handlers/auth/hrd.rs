@@ -142,7 +142,10 @@ pub async fn get_auth_context(
     let platform_providers = [
         ("github", state.config.platform_github_client_id.as_ref()),
         ("google", state.config.platform_google_client_id.as_ref()),
-        ("microsoft", state.config.platform_microsoft_client_id.as_ref()),
+        (
+            "microsoft",
+            state.config.platform_microsoft_client_id.as_ref(),
+        ),
     ]
     .into_iter()
     .filter(|(_, id)| id.as_ref().is_some_and(|id| !id.trim().is_empty()))
@@ -170,9 +173,10 @@ pub async fn get_auth_context(
 
     // An org with no providers configured gets no buttons — not the
     // platform fallback (A9).
-    let mut available_providers = OrganizationStore::list_oauth_providers(DB::Conn(&state.db), &org.id)
-        .await
-        .unwrap_or_default();
+    let mut available_providers =
+        OrganizationStore::list_oauth_providers(DB::Conn(&state.db), &org.id)
+            .await
+            .unwrap_or_default();
 
     let service = if let Some(service_slug) = query
         .service

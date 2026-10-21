@@ -24,6 +24,13 @@ jobs:
       contents: read
       id-token: write
     steps:
+      - name: Check npm token
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          npm whoami
+          npm trust list @drmhse/sso-sdk || true
+
       - name: Request GitHub OIDC and exchange for npm
         env:
           PACKAGE_NAME: '@drmhse/sso-sdk'

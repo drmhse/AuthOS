@@ -16,49 +16,6 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  diagnose_oidc:
-    name: Diagnose npm trusted publishing exchange
-    if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - name: Check npm token
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          npm whoami
-          npm trust list @drmhse/sso-sdk || true
-
-      - name: Request GitHub OIDC and exchange for npm
-        env:
-          PACKAGE_NAME: '@drmhse/sso-sdk'
-        run: |
-          node <<'NODE'
-          const url = new URL(process.env.ACTIONS_ID_TOKEN_REQUEST_URL);
-          url.searchParams.append('audience', 'npm:registry.npmjs.org');
-          const response = await fetch(url, {
-            headers: { authorization: `Bearer ${process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN}` },
-          });
-          const payload = await response.json();
-          if (!response.ok || !payload.value) {
-            console.error('OIDC request failed', response.status, payload);
-            process.exit(1);
-          }
-          const [, body] = payload.value.split('.');
-          console.log('OIDC claims:', Buffer.from(body, 'base64url').toString('utf8'));
-          for (const encoded of ['@drmhse%2fsso-sdk', '%40drmhse%2Fsso-sdk']) {
-            const exchange = await fetch(
-              `https://registry.npmjs.org/-/npm/v1/oidc/token/exchange/package/${encoded}`,
-              { method: 'POST', headers: { authorization: `Bearer ${payload.value}` } },
-            );
-            console.log('Exchange path:', encoded);
-            console.log('Exchange status:', exchange.status);
-            console.log('Exchange body:', await exchange.text());
-          }
-          NODE
-
   qualify:
     name: Qualify exact release source
     runs-on: ubuntu-latest

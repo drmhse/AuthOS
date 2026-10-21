@@ -496,6 +496,12 @@ pub async fn start_linked_account(
     Query(query): Query<crate::handlers::identities::StartLinkQuery>,
     auth_user: AuthUser,
 ) -> Result<Json<crate::handlers::identities::StartLinkResponse>> {
+    crate::middleware::require_recent_authentication(
+        &state.db,
+        &auth_user,
+        chrono::Duration::minutes(10),
+    )
+    .await?;
     let service = current_service_from_claims(&state, &auth_user).await?;
     let (
         authorization_url,

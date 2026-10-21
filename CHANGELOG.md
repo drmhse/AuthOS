@@ -3,9 +3,82 @@
 This file records notable user-facing and project-level changes to AuthOS. The
 project is pre-1.0; breaking changes are called out explicitly when known.
 
-## [Unreleased]
+## 0.8.14 - 2026-10-21
 
-No changes yet.
+### Security
+
+- Platform authority is now bound to a platform-context management token
+  (no organization/service claims, `aud=platform`), a live non-deleted platform
+  owner row, enrolled MFA, and a signed MFA-completion marker from the current
+  login. Tenant- and service-scoped tokens can no longer invoke
+  `/api/platform/*`. Passkey-only platform sessions and refreshed sessions that
+  did not complete the MFA challenge must reauthenticate before using platform
+  controls.
+- Service-login tokens are limited to `GET /api/user` and
+  `GET /api/subscription`; they cannot reach organization, privacy, MFA, device,
+  or platform management routes.
+- Platform-owner promotion now rejects tenant-scoped identities, revokes every
+  existing session and refresh family, and requires fresh login plus MFA
+  enrollment before platform controls become available. Demotion also revokes
+  sessions.
+- Account email changes, password set/change, MFA setup, MFA disable, and backup
+  code regeneration now require recent authentication plus a current password
+  and/or MFA code as configured. Email changes invalidate outstanding
+  verification, reset, and magic-link tokens, clear verification state, notify
+  the old address, and revoke other sessions.
+- Magic-link login now honors enrolled MFA instead of issuing a full session.
+- Passkey registration and identity/linked-account linking require recent
+  session authentication, preventing a stolen session from adding a durable
+  login method without a fresh sign-in.
+- SCIM cannot change platform-owner accounts or organization owner/admin email
+  addresses; SCIM email changes clear verification and revoke sessions.
+- Platform-context browser sign-in is restricted to configured platform
+  origins. Bootstrap login honors MFA when a factor is already enrolled, is
+  rate-limited, and the lite client routes new owners through MFA enrollment.
+  A no-Origin bootstrap call from the local standalone installer retains a
+  narrow provisioning exception; browser bootstrap links still require MFA,
+  and MFA enrollment revokes the bootstrap session. The Docker bootstrap
+  provisioner now fails clearly instead of treating an MFA pre-auth challenge
+  as a management token; use the standalone/bootstrap recovery flow when MFA is
+  enabled.
+- Admin OAuth now requires a verified primary GitHub email and prefers the
+  Microsoft UPN over the mutable mail attribute.
+- Failed password logins are throttled per normalized email, and "revoke all
+  devices" now also revokes other sessions.
+- Account email/password changes now revoke other sessions atomically with the
+  credential mutation, and disabling MFA is refused when no factor is enabled.
+- Platform admin CLI device authorization carries the MFA-completion marker
+  when the owner has an enrolled factor.
+- Password-registration invitations are accepted only after email verification,
+  not at account creation. Platform-owner email changes must go through managed
+  platform configuration so the configured bootstrap/admin OAuth identity does
+  not drift.
+
+### Changed
+
+- `PATCH /api/user`, `POST /api/user/set-password`,
+  `POST /api/user/change-password`, MFA setup/disable, and backup-code
+  regeneration now accept step-up fields (`current_password`, `mfa_code`) and
+  reject changes that do not prove the configured factors. MFA enable/disable
+  responses rotate the session and include fresh `access_token` /
+  `refresh_token` values. The TypeScript SDK and Lite client are updated; older
+  clients must reauthenticate after a factor change.
+- Service-login JWTs are restricted to profile and subscription reads.
+  Organization and platform integrations must use their organization or
+  platform-context tokens instead.
+- Platform controls now require a fresh MFA-completed login. Access-token
+  refresh preserves ordinary account and tenant access but does not restore
+  platform authority; sign in again with password or magic link and complete
+  the MFA challenge.
+- The Lite account-security UI disables platform-owner email editing and sends
+  owners without a completed MFA challenge back through sign-in before showing
+  managed platform configuration.
+
+### Fixed
+
+- npm publication uses GitHub OIDC trusted publishing instead of the expired
+  long-lived `NPM_TOKEN`. The v0.8.13 release reached the draft stage but failed
+  to publish npm packages; v0.8.14 is the recovery release.
 
 ## 0.8.13 - 2026-09-29
 
@@ -487,7 +560,8 @@ No changes yet.
 Earlier pre-1.0 history is available from
 [GitHub Releases](https://github.com/drmhse/AuthOS/releases).
 
-[Unreleased]: https://github.com/drmhse/AuthOS/compare/v0.8.6...HEAD
+[Unreleased]: https://github.com/drmhse/AuthOS/compare/v0.8.14...HEAD
+[0.8.14]: https://github.com/drmhse/AuthOS/compare/v0.8.13...v0.8.14
 [0.8.6]: https://github.com/drmhse/AuthOS/compare/v0.8.5...v0.8.6
 [0.8.5]: https://github.com/drmhse/AuthOS/compare/v0.8.4...v0.8.5
 [0.8.4]: https://github.com/drmhse/AuthOS/compare/v0.8.3...v0.8.4

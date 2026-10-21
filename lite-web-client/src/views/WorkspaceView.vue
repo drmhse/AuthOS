@@ -67,7 +67,7 @@ const badgeLabel = computed(() => {
   return '';
 });
 const badgeTone = computed(() => (workspaceStore.mode === 'handoff' ? 'warning' : 'success'));
-const showSetup = computed(() => authStore.isPlatformOwner && workspaceStore.managedConfigEnabled);
+const showSetup = computed(() => authStore.isPlatformOwner && authStore.isPlatformContext && workspaceStore.managedConfigEnabled);
 const orgLabel = computed(() => workspaceStore.currentOrgName || 'AuthOS Lite');
 const orgInteractive = computed(() => workspaceStore.mode === 'handoff' && Boolean(workspaceStore.fullClientUrl));
 

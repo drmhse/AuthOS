@@ -406,6 +406,16 @@ pub fn protected_routes(state: &AppState) -> Router<AppState> {
         .layer(axum_middleware::from_fn(
             middleware::extract_request_info_middleware,
         ))
+        // JWT extraction is outermost so the service-token boundary can read
+        // the authenticated claims. Service tokens are limited to profile and
+        // subscription reads; they cannot reach organization or account
+        // management routes.
+        .route_layer(axum_middleware::from_fn(
+            middleware::reject_impersonation_for_sensitive_actions,
+        ))
+        .route_layer(axum_middleware::from_fn(
+            middleware::enforce_service_token_scope,
+        ))
         .route_layer(axum_middleware::from_fn_with_state(
             state.clone(),
             middleware::extract_user_from_jwt,
@@ -433,6 +443,9 @@ pub fn analytics_routes(state: &AppState) -> Router<AppState> {
         )
         .layer(axum_middleware::from_fn(
             middleware::extract_request_info_middleware,
+        ))
+        .route_layer(axum_middleware::from_fn(
+            middleware::enforce_service_token_scope,
         ))
         .route_layer(axum_middleware::from_fn_with_state(
             state.clone(),
@@ -470,6 +483,12 @@ pub fn mfa_routes(state: &AppState, config: &Config) -> Router<AppState> {
     routes
         .layer(axum_middleware::from_fn(
             middleware::extract_request_info_middleware,
+        ))
+        .route_layer(axum_middleware::from_fn(
+            middleware::reject_impersonation_for_sensitive_actions,
+        ))
+        .route_layer(axum_middleware::from_fn(
+            middleware::enforce_service_token_scope,
         ))
         .route_layer(axum_middleware::from_fn_with_state(
             state.clone(),
@@ -603,6 +622,9 @@ pub fn platform_routes(state: &AppState) -> Router<AppState> {
         )
         .layer(axum_middleware::from_fn(
             middleware::extract_request_info_middleware,
+        ))
+        .route_layer(axum_middleware::from_fn(
+            middleware::enforce_service_token_scope,
         ))
         .route_layer(axum_middleware::from_fn_with_state(
             state.clone(),
@@ -913,6 +935,7 @@ mod router_smoke_tests {
     use crate::crypto::jwt::JwtService;
     use crate::crypto::sso::OAuthClient;
     use crate::db::DB;
+    use crate::entities::users;
     use crate::rsa_keys::GeneratedKey;
     use crate::services::{
         events::EventDispatcher, metrics::MfaMetricsService, risk_engine::RiskEngine,
@@ -924,7 +947,7 @@ mod router_smoke_tests {
     use base64::{engine::general_purpose::STANDARD, Engine};
     use migration::{Migrator, MigratorTrait};
     use moka::future::Cache;
-    use sea_orm::Database;
+    use sea_orm::{ActiveModelTrait, Database, Set};
     use std::sync::Arc;
     use tower::ServiceExt;
 
@@ -1097,6 +1120,7 @@ mod router_smoke_tests {
         .await
         .expect("seed session for token");
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/api/user")
@@ -1112,5 +1136,74 @@ mod router_smoke_tests {
             String::from_utf8(body.to_vec()).unwrap().contains(&user.id),
             "the authenticated identity must be echoed back"
         );
+
+        // A service-login token may read the profile but must not reach
+        // organization or platform management routes.
+        let service_token = jwt_service
+            .create_token(&user.id, &user.email, false, Some("acme"), Some("portal"))
+            .expect("service token");
+        crate::store::sessions::SessionStore::create(
+            DB::Conn(&db),
+            &user.id,
+            &JwtService::hash_token(&service_token),
+            (chrono::Utc::now() + chrono::Duration::hours(1)).naive_utc(),
+            None,
+            None,
+            Some("acme"),
+            Some("service-id"),
+            None,
+            Some("router-smoke-test"),
+            Some("127.0.0.1"),
+        )
+        .await
+        .expect("seed service session");
+
+        let profile = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/user")
+                    .header(header::AUTHORIZATION, format!("Bearer {service_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(profile.status(), StatusCode::OK);
+
+        let organization_management = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/organizations")
+                    .header(header::AUTHORIZATION, format!("Bearer {service_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(organization_management.status(), StatusCode::FORBIDDEN);
+
+        // A soft-deleted user must not keep using a still-valid session.
+        let mut deleted: users::ActiveModel = UserStore::find_by_id(DB::Conn(&db), &user.id)
+            .await
+            .expect("load user")
+            .expect("user exists")
+            .into();
+        deleted.deleted_at = Set(Some(chrono::Utc::now().naive_utc()));
+        deleted.update(&db).await.expect("soft-delete user");
+        state.user_cache.invalidate(&user.id).await;
+
+        let deleted_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/user")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(deleted_response.status(), StatusCode::UNAUTHORIZED);
     }
 }

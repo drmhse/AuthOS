@@ -7,7 +7,6 @@ use crate::state::AppState;
 use crate::store::{
     email_verification::EmailVerificationStore,
     identities::IdentityStore,
-    invitations::InvitationStore,
     memberships::MembershipStore,
     organizations::OrganizationStore,
     password_reset::PasswordResetStore,
@@ -314,10 +313,12 @@ pub async fn register(
     let (issuing_org_id, issuing_service_id) = if let (Some(org_s), Some(service_s)) =
         (&org_slug, &service_slug)
     {
-        // Validate that org exists
+        // Validate that the tenant is active before creating a scoped user.
         let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), org_s)
             .await?
             .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
+        let org =
+            crate::handlers::organizations::ensure_organization_active(&state.db, &org.id).await?;
 
         // Validate that service exists within org
         let service = ServiceStore::find_by_org_and_slug(DB::Conn(&state.db), &org.id, service_s)
@@ -335,6 +336,8 @@ pub async fn register(
         let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), org_s)
             .await?
             .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
+        let org =
+            crate::handlers::organizations::ensure_organization_active(&state.db, &org.id).await?;
 
         (Some(org.id), None)
     } else {
@@ -384,9 +387,6 @@ pub async fn register(
                         .await?
                 };
                 let user_id = user.id.clone();
-
-                // Automatically accept any pending invitations for this email
-                InvitationStore::accept_all_pending_for_email(db.clone(), &email, &user_id).await?;
 
                 // Create password identity with org/service context (if provided)
                 // This ensures password users are tracked the same as OAuth users
@@ -548,6 +548,23 @@ pub async fn verify_email(
         ));
     }
 
+    // Invitations are granted only after the user proves control of the email
+    // address. This is best-effort: a tenant limit or suspended organization
+    // must not roll back a successful email verification.
+    if let Ok(Some(user)) = UserStore::find_by_id(DB::Conn(&state.db), &user_id).await {
+        if let Err(error) =
+            crate::store::invitations::InvitationStore::accept_all_pending_for_email(
+                DB::Conn(&state.db),
+                &user.email,
+                &user.id,
+            )
+            .await
+        {
+            tracing::warn!(user_id = %user.id, error = %error, "Failed to accept pending invitations after email verification");
+        }
+        state.permission_cache.invalidate(&user_id).await;
+    }
+
     Ok(Html(
         "<html><body><h1>Email Verified!</h1><p>Your email has been verified successfully. You can now log in.</p></body></html>".to_string()
     ))
@@ -557,8 +574,19 @@ pub async fn verify_email(
 pub async fn login(
     State(state): State<AppState>,
     Extension(request_info): Extension<RequestInfo>,
+    headers: axum::http::HeaderMap,
     Json400(req): Json400<LoginRequest>,
 ) -> Result<Json<RefreshTokenResponse>> {
+    if !state.config.disable_rate_limiting
+        && crate::middleware::LOGIN_ATTEMPT_LIMITER
+            .is_rate_limited(&req.email)
+            .await
+    {
+        return Err(AppError::TooManyRequests(
+            "Too many failed sign-in attempts. Please try again later.".to_string(),
+        ));
+    }
+
     // Resolve org_id from slug if provided to establish tenant context
     let context_org_id = if let Some(ref slug) = req.org_slug {
         let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), slug)
@@ -569,6 +597,10 @@ pub async fn login(
     } else {
         None
     };
+
+    if context_org_id.is_none() {
+        crate::middleware::ensure_trusted_platform_origin(&headers, &state.config)?;
+    }
 
     reject_upstream_only_local_auth(
         &state,
@@ -605,6 +637,9 @@ pub async fn login(
     // - Password verification failed, OR
     // - We were using dummy hash (user doesn't exist or has no password)
     if !is_valid || is_dummy {
+        crate::middleware::LOGIN_ATTEMPT_LIMITER
+            .record_failure(&req.email)
+            .await;
         // With an org context and a correct password, say so: the account
         // exists globally but has no identity in this organization (A6).
         // This reveals nothing without the password — the verification
@@ -635,6 +670,9 @@ pub async fn login(
     }
 
     // At this point, user exists and password is valid
+    crate::middleware::LOGIN_ATTEMPT_LIMITER
+        .clear(&req.email)
+        .await;
     let user = user.expect("User must exist when is_dummy is false");
 
     // Check if email is verified
@@ -1127,11 +1165,12 @@ pub async fn forgot_password(
         return Ok(generic_password_reset_response());
     }
 
-    // Generate password reset token
+    // Generate password reset token. Invalidate earlier reset links so only
+    // the most recently requested link is valid.
     let reset_token = Uuid::new_v4().to_string();
     let token_hash = hash_token(&reset_token);
     let expires_at = Utc::now() + chrono::Duration::hours(1);
-
+    PasswordResetStore::delete_all_for_user(DB::Conn(&state.db), &user.id).await?;
     PasswordResetStore::create(
         DB::Conn(&state.db),
         &user.id,
@@ -1189,6 +1228,8 @@ async fn complete_password_reset(
         return Ok(false);
     }
     UserStore::update_password_hash(db.clone(), user_id, password_hash).await?;
+    crate::store::password_reset::PasswordResetStore::delete_all_for_user(db.clone(), user_id)
+        .await?;
     SessionStore::delete_all_for_user(db, user_id).await?;
     Ok(true)
 }
@@ -1348,7 +1389,9 @@ pub async fn resend_verification(
     let token_hash = hash_token(&verification_token);
     let expires_at = Utc::now() + chrono::Duration::hours(24);
 
-    // Create new verification record
+    // Invalidate older verification links so only the most recently issued
+    // link can verify the address.
+    EmailVerificationStore::delete_all_for_user(DB::Conn(&state.db), &user.id).await?;
     EmailVerificationStore::create(
         DB::Conn(&state.db),
         &user.id,
@@ -1578,6 +1621,7 @@ mod tests {
                 ip_address: "127.0.0.1".to_string(),
                 user_agent: "password-login-test".to_string(),
             }),
+            axum::http::HeaderMap::new(),
             Json400(LoginRequest {
                 email: fixture.email.clone(),
                 password: fixture.password.clone(),
@@ -1599,6 +1643,7 @@ mod tests {
                 ip_address: "127.0.0.1".to_string(),
                 user_agent: "password-enumeration-test".to_string(),
             }),
+            axum::http::HeaderMap::new(),
             Json400(LoginRequest {
                 email: email.to_string(),
                 password: "DefinitelyWrongPassword1!".to_string(),

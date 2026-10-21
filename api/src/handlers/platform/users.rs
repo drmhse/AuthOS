@@ -5,7 +5,10 @@ use crate::entities::{user_totp_secrets, users};
 use crate::error::{AppError, Result};
 use crate::middleware::AuthUser;
 use crate::state::AppState;
-use crate::store::{totp::TotpStore, users::UserStore};
+use crate::store::{
+    distributed_locks::DistributedLockStore, sessions::SessionStore, totp::TotpStore,
+    users::UserStore,
+};
 use axum::{
     extract::{Path, Query, State},
     Extension, Json,
@@ -192,6 +195,16 @@ pub async fn promote_platform_owner(
                         "User is already a platform owner".to_string(),
                     ));
                 }
+                if user_model.deleted_at.is_some() {
+                    return Err(AppError::BadRequest(
+                        "Deleted users cannot be promoted to platform owner".to_string(),
+                    ));
+                }
+                if user_model.org_id.is_some() {
+                    return Err(AppError::BadRequest(
+                        "Only platform-scoped users can be promoted to platform owner. Use or create the user's platform account instead of promoting a tenant identity.".to_string(),
+                    ));
+                }
 
                 // Update user
                 let mut user_active: users::ActiveModel = user_model.into();
@@ -199,6 +212,7 @@ pub async fn promote_platform_owner(
 
                 let updated_user_model = user_active.update(&db).await?;
                 let updated_user = user_model_to_old(updated_user_model.clone());
+                SessionStore::delete_all_for_user(db.clone(), &user_id).await?;
 
                 create_audit_log(
                     &db,
@@ -217,6 +231,11 @@ pub async fn promote_platform_owner(
         },
     )
     .await?;
+
+    // Promotion is a new authority boundary. Session revocation is part of the
+    // promotion transaction; invalidate cached snapshots after commit.
+    state.user_cache.invalidate(&updated_user.id).await;
+    state.permission_cache.invalidate(&updated_user.id).await;
 
     Ok(Json(updated_user))
 }
@@ -241,7 +260,24 @@ pub async fn demote_platform_owner(
 
     let owner_id = auth_user.user.id.clone();
 
-    let updated_user = with_retrying_transaction(
+    // Serialize roster changes so two concurrent demotions cannot both pass
+    // the last-owner count check and leave the platform without an owner.
+    let roster_lock_key = "platform-owner-roster";
+    let roster_lock_owner = format!("demote:{}", uuid::Uuid::new_v4());
+    if !DistributedLockStore::try_acquire_lock(
+        DB::Conn(&state.db),
+        roster_lock_key,
+        &roster_lock_owner,
+        30,
+    )
+    .await?
+    {
+        return Err(AppError::TooManyRequests(
+            "Another platform-owner change is in progress. Please retry.".to_string(),
+        ));
+    }
+
+    let transaction_result = with_retrying_transaction(
         &state.db,
         #[cfg(feature = "db_sqlite")]
         &state.db_writer,
@@ -277,6 +313,7 @@ pub async fn demote_platform_owner(
 
                 let updated_user_model = user_active.update(&db).await?;
                 let updated_user = user_model_to_old(updated_user_model.clone());
+                SessionStore::delete_all_for_user(db.clone(), &user_id).await?;
 
                 create_audit_log(
                     &db,
@@ -294,7 +331,19 @@ pub async fn demote_platform_owner(
             })
         },
     )
-    .await?;
+    .await;
+    let _ = DistributedLockStore::release_lock(
+        DB::Conn(&state.db),
+        roster_lock_key,
+        &roster_lock_owner,
+    )
+    .await;
+    let updated_user = transaction_result?;
+
+    // Session revocation is part of the demotion transaction; invalidate
+    // cached snapshots after commit.
+    state.user_cache.invalidate(&updated_user.id).await;
+    state.permission_cache.invalidate(&updated_user.id).await;
 
     Ok(Json(updated_user))
 }
@@ -404,7 +453,8 @@ mod tests {
     use crate::billing::providers::disabled::DisabledBillingProvider;
     use crate::crypto::sso::OAuthClient;
 
-    use crate::entities::users;
+    use crate::crypto::jwt::JwtService;
+    use crate::entities::{prelude::Sessions, users};
 
     use crate::audit::actor::AuditHandle;
     use crate::db::DB;
@@ -412,11 +462,14 @@ mod tests {
         events::EventDispatcher, metrics::MfaMetricsService, risk_engine::RiskEngine,
     };
     use crate::state::AppState;
-    use crate::store::{memberships::MembershipStore, users::UserStore};
+    use crate::store::{
+        memberships::MembershipStore, organizations::OrganizationStore, sessions::SessionStore,
+        users::UserStore,
+    };
 
     use migration::{Migrator, MigratorTrait};
     use moka::future::Cache;
-    use sea_orm::Database;
+    use sea_orm::{ColumnTrait, Database, EntityTrait, PaginatorTrait, QueryFilter};
     use std::sync::Arc;
 
     use crate::test_support::test_config;
@@ -577,6 +630,92 @@ mod tests {
             ) => {}
             other => panic!("expected all-forbidden, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn promotion_rejects_tenant_scoped_users_and_revokes_prior_sessions() {
+        let f = fixture().await;
+        let (org, _) = OrganizationStore::create_with_owner(
+            DB::Conn(&f.state.db),
+            "tenant-promotion-org",
+            "Tenant Promotion Org",
+            &f.plain_user_model.id,
+            None,
+        )
+        .await
+        .expect("create tenant org");
+        let tenant_user = UserStore::create_with_org_id(
+            DB::Conn(&f.state.db),
+            "tenant-promotion@example.test",
+            None,
+            &org.id,
+        )
+        .await
+        .expect("create tenant-scoped user");
+        MembershipStore::create(DB::Conn(&f.state.db), &org.id, &tenant_user.id, "member")
+            .await
+            .expect("tenant membership");
+
+        match promote_platform_owner(
+            State(f.state.clone()),
+            Extension(f.owner.clone()),
+            Json(PromoteOwnerRequest {
+                user_id: tenant_user.id.clone(),
+            }),
+        )
+        .await
+        {
+            Err(AppError::BadRequest(message)) => {
+                assert!(message.contains("platform-scoped"))
+            }
+            other => panic!("expected tenant-scoped promotion refusal, got {other:?}"),
+        }
+
+        let token = f
+            .state
+            .jwt_service
+            .create_token(
+                &f.plain_user_model.id,
+                &f.plain_user_model.email,
+                false,
+                None,
+                None,
+            )
+            .expect("plain user token");
+        SessionStore::create(
+            DB::Conn(&f.state.db),
+            &f.plain_user_model.id,
+            &JwtService::hash_token(&token),
+            (chrono::Utc::now() + chrono::Duration::hours(1)).naive_utc(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("promotion-test"),
+            Some("127.0.0.1"),
+        )
+        .await
+        .expect("plain user session");
+
+        let Json(promoted) = promote_platform_owner(
+            State(f.state.clone()),
+            Extension(f.owner.clone()),
+            Json(PromoteOwnerRequest {
+                user_id: f.plain_user_model.id.clone(),
+            }),
+        )
+        .await
+        .expect("promote platform-scoped user");
+        assert!(promoted.is_platform_owner);
+        assert_eq!(
+            Sessions::find()
+                .filter(crate::entities::sessions::Column::UserId.eq(&f.plain_user_model.id))
+                .count(&f.state.db)
+                .await
+                .expect("count sessions"),
+            0
+        );
     }
 
     #[tokio::test]

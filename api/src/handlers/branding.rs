@@ -145,27 +145,41 @@ async fn clear_custom_domain_with_audit(
 async fn require_settings_manager(
     state: &AppState,
     org_id: &str,
-    user_id: &str,
-    is_platform_owner: bool,
+    auth_user: &AuthUser,
 ) -> Result<(), AppError> {
-    require_settings_manager_in(DB::Conn(&state.db), org_id, user_id, is_platform_owner).await
+    require_settings_manager_in(
+        DB::Conn(&state.db),
+        org_id,
+        &auth_user.user.id,
+        auth_user.claims.is_platform_context(),
+        auth_user.claims.mfa_verified == Some(true) || auth_user.claims.bootstrap == Some(true),
+    )
+    .await
 }
 
 async fn require_settings_manager_in(
     db: DB<'_>,
     org_id: &str,
     user_id: &str,
-    is_platform_owner: bool,
+    platform_token_context: bool,
+    platform_mfa_verified: bool,
 ) -> Result<(), AppError> {
     OrganizationStore::find_by_id(db.clone(), org_id)
         .await?
         .filter(|org| org.status == "active")
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
-    // The JWT flag and the request's cached user snapshot are only hints. A
-    // platform-owner demotion must take effect on the next authorization
-    // check, including transaction retries that started before the demotion.
-    if has_live_platform_authority_in(db.clone(), user_id, is_platform_owner).await? {
+    // Platform authority is only valid from a platform-context token with a
+    // live owner role and MFA enrollment. Transaction retries therefore cannot
+    // inherit a stale tenant-scoped token or a demoted owner.
+    if crate::middleware::has_live_platform_authority_in(
+        db.clone(),
+        user_id,
+        platform_token_context,
+        platform_mfa_verified,
+    )
+    .await?
+    {
         return Ok(());
     }
 
@@ -176,19 +190,6 @@ async fn require_settings_manager_in(
     Err(AppError::Forbidden(
         "Insufficient permissions to manage organization settings".to_string(),
     ))
-}
-
-async fn has_live_platform_authority_in(
-    db: DB<'_>,
-    user_id: &str,
-    authority_hint: bool,
-) -> Result<bool, AppError> {
-    if !authority_hint {
-        return Ok(false);
-    }
-    Ok(crate::store::users::UserStore::find_by_id(db, user_id)
-        .await?
-        .is_some_and(|user| user.is_platform_owner && user.deleted_at.is_none()))
 }
 
 // Request/Response Types
@@ -218,13 +219,7 @@ pub async fn set_custom_domain(
         .filter(|org| org.status == "active")
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
-    require_settings_manager(
-        &state,
-        &org.id,
-        &auth_user.claims.sub,
-        auth_user.user.is_platform_owner,
-    )
-    .await?;
+    require_settings_manager(&state, &org.id, &auth_user).await?;
 
     // Tier/Entitlement Check
     TierService::check_feature_access(
@@ -260,7 +255,9 @@ pub async fn set_custom_domain(
     let expected_verification_token = org.domain_verification_token.clone();
     let expected_verified = org.domain_verified;
     let actor_id = auth_user.claims.sub.clone();
-    let actor_is_platform_owner = auth_user.user.is_platform_owner;
+    let actor_has_platform_context = auth_user.claims.is_platform_context();
+    let actor_has_platform_mfa =
+        auth_user.claims.mfa_verified == Some(true) || auth_user.claims.bootstrap == Some(true);
     let domain_clone = domain.clone();
     let verification_token_clone = verification_token.clone();
     use crate::services::audit_builder::OrgAuditBuilder;
@@ -290,7 +287,8 @@ pub async fn set_custom_domain(
                     db.clone(),
                     &org_id,
                     &actor_id,
-                    actor_is_platform_owner,
+                    actor_has_platform_context,
+                    actor_has_platform_mfa,
                 )
                 .await?;
                 TierService::check_feature_access(
@@ -355,13 +353,7 @@ pub async fn verify_custom_domain(
         .filter(|org| org.status == "active")
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
-    require_settings_manager(
-        &state,
-        &org.id,
-        &auth_user.claims.sub,
-        auth_user.user.is_platform_owner,
-    )
-    .await?;
+    require_settings_manager(&state, &org.id, &auth_user).await?;
 
     // Check if domain is set
     let domain = org
@@ -394,7 +386,9 @@ pub async fn verify_custom_domain(
         let expected_domain = domain.clone();
         let expected_verification_token = verification_token.clone();
         let actor_id = auth_user.claims.sub.clone();
-        let actor_is_platform_owner = auth_user.user.is_platform_owner;
+        let actor_has_platform_context = auth_user.claims.is_platform_context();
+        let actor_has_platform_mfa =
+            auth_user.claims.mfa_verified == Some(true) || auth_user.claims.bootstrap == Some(true);
         use crate::services::audit_builder::OrgAuditBuilder;
         let event = OrgAuditBuilder::new(&org.id, Some(&auth_user.claims.sub), "domain.verified")
             .target("organization", &org.id)
@@ -422,7 +416,8 @@ pub async fn verify_custom_domain(
                         db.clone(),
                         &org_id,
                         &actor_id,
-                        actor_is_platform_owner,
+                        actor_has_platform_context,
+                        actor_has_platform_mfa,
                     )
                     .await?;
                     mark_custom_domain_verified_with_audit(
@@ -468,13 +463,7 @@ pub async fn get_domain_configuration(
         .filter(|org| org.status == "active")
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
-    if !has_live_platform_authority_in(
-        DB::Conn(&state.db),
-        &auth_user.user.id,
-        auth_user.user.is_platform_owner,
-    )
-    .await?
-    {
+    if !crate::middleware::has_live_platform_authority(&state.db, &auth_user).await? {
         let is_member =
             MembershipStore::is_member(DB::Conn(&state.db), &org.id, &auth_user.claims.sub).await?;
 
@@ -501,19 +490,15 @@ pub async fn delete_custom_domain(
         .filter(|org| org.status == "active")
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
-    require_settings_manager(
-        &state,
-        &org.id,
-        &auth_user.claims.sub,
-        auth_user.user.is_platform_owner,
-    )
-    .await?;
+    require_settings_manager(&state, &org.id, &auth_user).await?;
 
     let domain = org.custom_domain.clone();
     let verification_token = org.domain_verification_token.clone();
     let domain_verified = org.domain_verified;
     let actor_id = auth_user.claims.sub.clone();
-    let actor_is_platform_owner = auth_user.user.is_platform_owner;
+    let actor_has_platform_context = auth_user.claims.is_platform_context();
+    let actor_has_platform_mfa =
+        auth_user.claims.mfa_verified == Some(true) || auth_user.claims.bootstrap == Some(true);
     let org_id = org.id.clone();
     let event = domain.as_ref().map(|domain| {
         use crate::services::audit_builder::OrgAuditBuilder;
@@ -542,7 +527,8 @@ pub async fn delete_custom_domain(
                     db.clone(),
                     &org_id,
                     &actor_id,
-                    actor_is_platform_owner,
+                    actor_has_platform_context,
+                    actor_has_platform_mfa,
                 )
                 .await?;
                 clear_custom_domain_with_audit(
@@ -576,13 +562,7 @@ pub async fn update_branding(
         .filter(|org| org.status == "active")
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
-    require_settings_manager(
-        &state,
-        &org.id,
-        &auth_user.claims.sub,
-        auth_user.user.is_platform_owner,
-    )
-    .await?;
+    require_settings_manager(&state, &org.id, &auth_user).await?;
 
     // Tier/Entitlement Check
     TierService::check_feature_access(
@@ -615,7 +595,9 @@ pub async fn update_branding(
     let logo_url = req.logo_url.clone();
     let primary_color = req.primary_color.clone();
     let actor_id = auth_user.claims.sub.clone();
-    let actor_is_platform_owner = auth_user.user.is_platform_owner;
+    let actor_has_platform_context = auth_user.claims.is_platform_context();
+    let actor_has_platform_mfa =
+        auth_user.claims.mfa_verified == Some(true) || auth_user.claims.bootstrap == Some(true);
     use crate::services::audit_builder::OrgAuditBuilder;
     let event = OrgAuditBuilder::new(&org.id, Some(&auth_user.claims.sub), "branding.updated")
         .target("organization", &org.id)
@@ -644,7 +626,8 @@ pub async fn update_branding(
                     db.clone(),
                     &org_id,
                     &actor_id,
-                    actor_is_platform_owner,
+                    actor_has_platform_context,
+                    actor_has_platform_mfa,
                 )
                 .await?;
                 TierService::check_feature_access(
@@ -689,13 +672,7 @@ pub async fn get_branding(
         .filter(|org| org.status == "active")
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
-    if !has_live_platform_authority_in(
-        DB::Conn(&state.db),
-        &auth_user.user.id,
-        auth_user.user.is_platform_owner,
-    )
-    .await?
-    {
+    if !crate::middleware::has_live_platform_authority(&state.db, &auth_user).await? {
         let is_member =
             MembershipStore::is_member(DB::Conn(&state.db), &org.id, &auth_user.claims.sub).await?;
 
@@ -906,19 +883,27 @@ mod domain_verification_race_tests {
         UserStore::set_platform_owner(DB::Conn(&db), &stale_owner.id, false)
             .await
             .unwrap();
-        assert!(
-            !has_live_platform_authority_in(DB::Conn(&db), &stale_owner.id, true)
-                .await
-                .unwrap()
-        );
+        assert!(!crate::middleware::has_live_platform_authority_in(
+            DB::Conn(&db),
+            &stale_owner.id,
+            true,
+            true
+        )
+        .await
+        .unwrap());
 
         // Every write/verify/delete transaction enters through this live gate.
         for operation in ["write", "verify", "delete"] {
             let transaction = db.begin().await.unwrap();
-            let error =
-                require_settings_manager_in(DB::Tx(&transaction), &org.id, &stale_owner.id, true)
-                    .await
-                    .unwrap_err();
+            let error = require_settings_manager_in(
+                DB::Tx(&transaction),
+                &org.id,
+                &stale_owner.id,
+                true,
+                true,
+            )
+            .await
+            .unwrap_err();
             assert!(matches!(error, AppError::Forbidden(_)), "{operation}");
             transaction.rollback().await.unwrap();
         }
@@ -967,7 +952,7 @@ mod domain_verification_race_tests {
             .unwrap();
 
         assert!(matches!(
-            require_settings_manager_in(DB::Conn(&db), &org.id, &owner.id, true).await,
+            require_settings_manager_in(DB::Conn(&db), &org.id, &owner.id, true, true).await,
             Err(AppError::NotFound(_))
         ));
     }

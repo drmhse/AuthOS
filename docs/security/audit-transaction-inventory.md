@@ -41,9 +41,9 @@ same transaction; four events describe a rejected attempt or conflict without a
 paired domain mutation and use the standalone durable enqueue.
 There are zero unclassified calls.
 
-Across the complete current production tree, the structural checker finds 53
+Across the complete current production tree, the structural checker finds 54
 physical `AuditHandle` call expressions: 50 use a caller-supplied transaction
-and three are the allowlisted standalone result/rejection events below. The
+and four are the allowlisted standalone result/rejection events below. The
 earlier 35+4 figures describe the original remaining-inventory baseline, not
 the whole tree. Two OAuth completion routes intentionally share one coupled
 session/audit helper, so route-flow counts need not equal physical call-expression
@@ -85,11 +85,12 @@ stale success event. Domain and branding mutations also recheck current
 management authority (and the applicable tier entitlement) inside that same
 transaction.
 
-The three intentionally standalone durable events are:
+The four intentionally standalone durable events are:
 
 | Path | Classification |
 | --- | --- |
 | `handlers/user.rs` | rejected TOTP enable verification |
+| `handlers/user.rs` | account-security MFA step-up success (result-only) |
 | `handlers/auth/mfa.rs` | rejected MFA verification result |
 | `handlers/auth/oauth.rs` | rejected provider-account conflict |
 

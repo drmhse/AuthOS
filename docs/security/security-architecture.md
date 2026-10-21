@@ -62,6 +62,44 @@ cache has a 60-second TTL. Some authorization changes explicitly invalidate
 caches, but comprehensive invalidation evidence is not yet published
 (`api/src/state.rs`, `api/src/lib.rs`).
 
+### Platform authority and service-token boundaries
+
+Platform authority requires all of the following at request time:
+
+1. a management token minted for the platform context (`aud=platform`, no
+   organization or service claim, and no actor claim);
+2. a current, non-deleted `is_platform_owner` database row;
+3. an enrolled TOTP factor; and
+4. a signed `mfa_verified=true` marker proving that the current token came from
+   the MFA completion flow, not merely from a session whose account has MFA
+   enrolled.
+
+Impersonation tokens always carry an actor claim and are never platform-context
+management tokens. Tenant- and service-scoped tokens never carry platform
+authority, even if the user row is later promoted. Promotion revokes every
+session and refresh-token family and requires a fresh login; platform owners
+must enroll MFA before the platform route boundary allows access. A passkey-only
+login or an access-token refresh does not restore platform authority, so the
+owner must complete password or magic-link sign-in and the MFA challenge again.
+Tenant handlers that grant a platform owner implicit bypass use the same live
+context, role, deletion, MFA-enrollment, and MFA-completion checks
+(`api/src/middleware.rs`).
+
+Service-login tokens are delivered to a relying party. They are accepted only
+for `GET /api/user` and `GET /api/subscription`; all organization, privacy,
+account-security, MFA, device, and platform routes reject them. Account email,
+password, and MFA changes additionally require recent session authentication
+plus the configured password/MFA factors. Magic-link verification honors
+enrolled MFA. Platform-context browser logins are restricted to configured
+platform origins so a tenant custom domain cannot receive a platform session.
+
+The one-time bootstrap login is the deliberate exception. A browser bootstrap
+link requires enrolled MFA when a factor is present; a no-Origin call from the
+local standalone installer receives a bootstrap session that may perform
+initial provisioning. The bootstrap token is a local one-time credential, the
+session is revoked when MFA is enabled, and platform-owner password/OAuth
+sessions still require an MFA-completed token.
+
 ### Tenant authorization
 
 Organizations are the tenant root. Services belong to an organization; many
@@ -203,9 +241,14 @@ distributed lock before session creation (`api/crates/authos-crypto/src/crypto/m
 `api/src/handlers/auth/mfa.rs`). MFA verification and setup routes have tighter
 IP rate limits.
 
-Recovery assurance, factor-reset policy, backup-code atomicity, pre-auth replay
-across replicas, and platform-owner MFA requirements are not yet established as
-release guarantees.
+Platform owners must enroll TOTP and complete the MFA challenge in the current
+login before platform routes are available. Account factor changes require
+recent authentication plus a current password and/or MFA code, revoke existing
+sessions, and return a fresh session after the factor is proven. Magic links
+challenge enrolled MFA rather than issuing a full session. Passkey-only and
+refreshed platform sessions do not inherit platform authority. Recovery
+assurance, factor-reset policy, backup-code atomicity, and pre-auth replay
+across replicas remain release-evidence items.
 
 ### Magic links and passkeys
 
@@ -473,7 +516,9 @@ items are exercised against a release candidate and restored backup.
    still lacks a release-candidate rollover/cache/retirement drill. Application
    encryption does not yet have an equivalent proven lifecycle.
 5. Tenant isolation is application-enforced with no database RLS defense in
-   depth; comprehensive matrix evidence is incomplete.
+   depth; comprehensive matrix evidence is incomplete. Service-login tokens are
+   restricted to profile/subscription reads, and platform authority is bound to
+   platform-context tokens with live MFA enrollment.
 6. `/metrics` has no dedicated listener and still needs deployment-level network
    restriction even though application bearer authentication is implemented.
 7. Rate limiting is process-local and may reset or multiply across replicas.

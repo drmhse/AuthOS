@@ -15,14 +15,7 @@ use serde::{Deserialize, Serialize};
 
 async fn require_settings_manager(state: &AppState, org_id: &str, user: &AuthUser) -> Result<()> {
     crate::handlers::organizations::ensure_organization_active(&state.db, org_id).await?;
-    let has_live_platform_authority = if user.user.is_platform_owner {
-        crate::store::users::UserStore::find_by_id(DB::Conn(&state.db), &user.user.id)
-            .await?
-            .is_some_and(|current| current.is_platform_owner && current.deleted_at.is_none())
-    } else {
-        false
-    };
-    if has_live_platform_authority
+    if crate::middleware::has_live_platform_authority(&state.db, user).await?
         || PermissionService::check(
             DB::Conn(&state.db),
             org_id,

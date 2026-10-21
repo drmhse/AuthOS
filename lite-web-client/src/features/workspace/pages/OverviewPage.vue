@@ -50,7 +50,7 @@
 
         <article class="workspace-stat-card">
           <div class="workspace-stat-card__label">Platform access</div>
-          <div class="workspace-stat-card__value">{{ authStore.isPlatformOwner ? 'Platform owner' : 'Organization member' }}</div>
+          <div class="workspace-stat-card__value">{{ authStore.isPlatformOwner && authStore.isPlatformContext ? 'Platform owner' : 'Organization member' }}</div>
         </article>
       </div>
 
@@ -126,5 +126,5 @@ const authStore = useAuthStore();
 const workspaceStore = useWorkspaceStore();
 const { reload, openFullClient } = useWorkspaceRuntime();
 
-const showSetup = computed(() => authStore.isPlatformOwner && workspaceStore.managedConfigEnabled);
+const showSetup = computed(() => authStore.isPlatformOwner && authStore.isPlatformContext && workspaceStore.managedConfigEnabled);
 </script>

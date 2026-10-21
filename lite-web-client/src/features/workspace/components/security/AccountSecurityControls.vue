@@ -6,10 +6,14 @@
 
     <AccountProfileCard
       :account-email="accountEmail"
+      :email-editable="!authStore.user?.is_platform_owner"
+      :account-mfa-code="accountMfaCode"
+      :mfa-enabled="Boolean(mfaStatus?.enabled)"
       :password-form="passwordForm"
       :account-saving="accountSaving"
       :password-saving="passwordSaving"
       @update:account-email="accountEmail = $event"
+      @update:account-mfa-code="accountMfaCode = $event"
       @update:password-form="passwordForm = $event"
       @save-account="saveAccount"
       @change-password="changePassword"
@@ -53,7 +57,7 @@
           id="security-dialog-input"
           v-model="dialog.inputValue"
           class="input"
-          type="text"
+          :type="dialog.inputType || 'text'"
         />
       </div>
 
@@ -61,7 +65,7 @@
         <BaseButton
           :variant="dialogConfirmVariant"
           :loading="dialogBusy"
-          :disabled="Boolean(dialog.inputLabel) && !dialog.inputValue.trim()"
+          :disabled="dialog.requireInput !== false && Boolean(dialog.inputLabel) && !dialog.inputValue.trim()"
           @click="confirmDialog"
         >
           {{ dialog.confirmLabel }}
@@ -91,6 +95,7 @@ const authStore = useAuthStore();
 const refreshVersion = toRef(props, 'refreshVersion');
 
 const accountEmail = ref('');
+const accountMfaCode = ref('');
 const accountSaving = ref(false);
 const passwordSaving = ref(false);
 const passwordForm = ref({ current: '', next: '' });
@@ -134,9 +139,14 @@ async function saveAccount() {
   accountSaving.value = true;
 
   try {
-    await sso.user.updateProfile({ email: accountEmail.value });
+    await sso.user.updateProfile({
+      email: accountEmail.value,
+      current_password: passwordForm.value.current || undefined,
+      mfa_code: accountMfaCode.value.trim() || undefined,
+    });
     await authStore.refreshUser();
-    setSuccess('Account email updated.');
+    accountMfaCode.value = '';
+    setSuccess('Account email updated. Check the new address for a verification link.');
   } catch (error) {
     setError(error.message || 'Failed to update the account email.');
   } finally {
@@ -156,8 +166,10 @@ async function changePassword() {
     await sso.user.changePassword({
       current_password: passwordForm.value.current,
       new_password: passwordForm.value.next,
+      mfa_code: accountMfaCode.value.trim() || undefined,
     });
     passwordForm.value = { current: '', next: '' };
+    accountMfaCode.value = '';
     setSuccess('Password changed.');
   } catch (error) {
     setError(error.message || 'Failed to change password.');

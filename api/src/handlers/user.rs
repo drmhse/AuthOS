@@ -5,12 +5,16 @@ use crate::encryption::EncryptionService;
 use crate::entities::prelude::{TotpBackupCodes, UserDevices, UserTotpSecrets};
 use crate::entities::{mfa_audit_log, totp_backup_codes, user_devices, user_totp_secrets, users};
 use crate::error::{AppError, Result};
+use crate::handlers::auth::email_delivery::ensure_email_delivery_configured;
+use crate::handlers::auth::password::hash_token;
 use crate::middleware::RequestInfo;
 use crate::services::audit_builder::MfaAuditBuilder;
+use crate::services::job_queue::JobQueueService;
 use crate::services::permission_service::PermissionService;
 use crate::state::AppState;
 use crate::store::{
-    organizations::OrganizationStore, user_devices::UserDevicesStore, users::UserStore,
+    email_verification::EmailVerificationStore, organizations::OrganizationStore,
+    sessions::SessionStore, totp::TotpStore, user_devices::UserDevicesStore, users::UserStore,
 };
 use axum::{
     extract::{Extension, Query, State},
@@ -25,9 +29,175 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use uuid::Uuid;
 
-#[derive(Debug, Deserialize)]
+const ACCOUNT_SECURITY_REAUTH_WINDOW_MINUTES: i64 = 10;
+
+#[derive(Debug, Deserialize, Default)]
 pub struct UpdateUserRequest {
     pub email: Option<String>,
+    /// Required when the account has a password. The generated SDK/UI prompts
+    /// for this when changing the account email.
+    #[serde(default)]
+    pub current_password: Option<String>,
+    /// Required when MFA is enabled.
+    #[serde(default)]
+    pub mfa_code: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct MfaSetupRequest {
+    #[serde(default)]
+    pub current_password: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct MfaConfirmationRequest {
+    #[serde(default)]
+    pub mfa_code: Option<String>,
+}
+
+async fn verify_current_password_if_configured(
+    user: &crate::entities::users::Model,
+    current_password: Option<&str>,
+) -> Result<()> {
+    let Some(expected_hash) = user.password_hash.as_ref() else {
+        return Ok(());
+    };
+    let password = current_password
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            AppError::Forbidden("Current password is required for this account change".to_string())
+        })?;
+    let is_valid = crate::crypto::concurrency::verify_password_bounded(
+        password.to_string(),
+        expected_hash.clone(),
+    )
+    .await?;
+    if !is_valid {
+        return Err(AppError::Unauthorized(
+            "Current password is incorrect".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+async fn verify_mfa_step_up(
+    state: &AppState,
+    user_id: &str,
+    org_slug: Option<&str>,
+    mfa_code: Option<&str>,
+) -> Result<()> {
+    if !TotpStore::is_enabled(DB::Conn(&state.db), user_id).await? {
+        return Ok(());
+    }
+    let code = mfa_code
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            AppError::Forbidden(
+                "A current MFA code is required for this account change".to_string(),
+            )
+        })?;
+    let backup_event = MfaAuditBuilder::new(user_id, "backup_code_used")
+        .org_id(org_slug)
+        .success(true)
+        .details(Some("context:account_security_step_up"))
+        .build();
+    if crate::handlers::user::verify_mfa_code_with_backup_audit(
+        &state.db,
+        user_id,
+        code,
+        (&state.audit_actor, backup_event),
+    )
+    .await?
+    .is_none()
+    {
+        return Err(AppError::Unauthorized("Invalid MFA code".to_string()));
+    }
+    state
+        .audit_actor
+        .log_mfa(
+            MfaAuditBuilder::new(user_id, "mfa_verify_success")
+                .org_id(org_slug)
+                .success(true)
+                .details(Some("context:account_security_step_up"))
+                .build(),
+        )
+        .await?;
+    Ok(())
+}
+
+async fn issue_post_factor_change_session(
+    state: &AppState,
+    auth_user: &crate::middleware::AuthUser,
+    user: &crate::entities::users::Model,
+) -> Result<(String, String, i64)> {
+    if auth_user.claims.service.is_some() {
+        return Err(AppError::Forbidden(
+            "Service-scoped sessions cannot change account MFA factors".to_string(),
+        ));
+    }
+
+    SessionStore::delete_all_for_user(DB::Conn(&state.db), &user.id).await?;
+    let access_token = state.jwt_service.create_mfa_verified_token(
+        &user.id,
+        &user.email,
+        user.is_platform_owner,
+        auth_user.claims.org.as_deref(),
+        None,
+    )?;
+    let refresh_token = crate::crypto::refresh_tokens::generate();
+    let now = Utc::now();
+    let expires_at = now + chrono::Duration::hours(state.config.jwt_expiration_hours);
+    let refresh_expires_at = now + chrono::Duration::days(30);
+    SessionStore::create(
+        DB::Conn(&state.db),
+        &user.id,
+        &hash_token(&access_token),
+        expires_at.naive_utc(),
+        Some(&refresh_token),
+        Some(refresh_expires_at.naive_utc()),
+        auth_user.claims.org.as_deref(),
+        None,
+        None,
+        Some(&auth_user.user_agent),
+        Some(&auth_user.ip_address),
+    )
+    .await?;
+
+    Ok((
+        access_token,
+        refresh_token,
+        state.config.jwt_expiration_hours * 3600,
+    ))
+}
+
+async fn require_account_security_reauthentication(
+    state: &AppState,
+    auth_user: &crate::middleware::AuthUser,
+    current_password: Option<&str>,
+    mfa_code: Option<&str>,
+) -> Result<()> {
+    crate::middleware::require_recent_authentication(
+        &state.db,
+        auth_user,
+        chrono::Duration::minutes(ACCOUNT_SECURITY_REAUTH_WINDOW_MINUTES),
+    )
+    .await?;
+    // Do not rely on the request's 30-second cached user snapshot for a
+    // security-sensitive password check.
+    let live_user = UserStore::find_by_id(DB::Conn(&state.db), &auth_user.user.id)
+        .await?
+        .filter(|user| user.deleted_at.is_none())
+        .ok_or_else(|| AppError::Unauthorized("User is no longer active".to_string()))?;
+    verify_current_password_if_configured(&live_user, current_password).await?;
+    verify_mfa_step_up(
+        state,
+        &live_user.id,
+        auth_user.claims.org.as_deref(),
+        mfa_code,
+    )
+    .await
 }
 
 #[derive(Debug, Deserialize)]
@@ -84,6 +254,15 @@ pub struct MfaVerifyRequest {
 pub struct MfaVerifyResponse {
     pub enabled: bool,
     pub backup_codes: Vec<String>,
+    /// New session credentials after a factor change. The previous session is
+    /// revoked so a session that enrolled or removed a factor cannot outlive
+    /// the factor state it was created under.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_in: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -241,10 +420,38 @@ pub async fn setup_mfa(
     State(state): State<AppState>,
     auth_user: Option<axum::extract::Extension<crate::middleware::AuthUser>>,
     request_info: Extension<RequestInfo>,
+    request: Option<Json<MfaSetupRequest>>,
 ) -> Result<Json<MfaSetupResponse>> {
     let auth_user = auth_user
         .ok_or_else(|| AppError::Unauthorized("Not authenticated".to_string()))?
         .0;
+    let request = request.map(|Json(request)| request).unwrap_or_default();
+    let live_user = UserStore::find_by_id(DB::Conn(&state.db), &auth_user.user.id)
+        .await?
+        .filter(|user| user.deleted_at.is_none())
+        .ok_or_else(|| AppError::Unauthorized("User is no longer active".to_string()))?;
+
+    let existing_secret = UserTotpSecrets::find()
+        .filter(user_totp_secrets::Column::UserId.eq(&auth_user.user.id))
+        .one(&state.db)
+        .await?;
+    if existing_secret
+        .as_ref()
+        .is_some_and(|secret| secret.enabled)
+    {
+        return Err(AppError::BadRequest(
+            "MFA is already enabled. Disable the current factor before enrolling a new one."
+                .to_string(),
+        ));
+    }
+
+    crate::middleware::require_recent_authentication(
+        &state.db,
+        &auth_user,
+        chrono::Duration::minutes(ACCOUNT_SECURITY_REAUTH_WINDOW_MINUTES),
+    )
+    .await?;
+    verify_current_password_if_configured(&live_user, request.current_password.as_deref()).await?;
 
     let mfa_service = MfaService::new();
     let secret = mfa_service.generate_totp_secret().map_err(|e| {
@@ -252,20 +459,16 @@ pub async fn setup_mfa(
     })?;
 
     let qr_code_svg = mfa_service
-        .generate_qr_code_svg(&secret, &auth_user.user.email)
+        .generate_qr_code_svg(&secret, &live_user.email)
         .map_err(|e| AppError::InternalServerError(format!("Failed to generate QR code: {}", e)))?;
     let qr_code_uri = mfa_service
-        .create_totp(&secret, &auth_user.user.email)
+        .create_totp(&secret, &live_user.email)
         .map_err(|e| AppError::InternalServerError(format!("Failed to create TOTP: {}", e)))?
         .get_url();
 
     let encryption_service = EncryptionService::new().map_err(|e| {
         AppError::InternalServerError(format!("Failed to initialize encryption: {}", e))
     })?;
-    let existing_secret = UserTotpSecrets::find()
-        .filter(user_totp_secrets::Column::UserId.eq(&auth_user.user.id))
-        .one(&state.db)
-        .await?;
 
     let event = MfaAuditBuilder::new(&auth_user.user.id, "mfa_setup_initiated")
         .org_id(auth_user.claims.org.as_deref())
@@ -341,6 +544,16 @@ pub async fn verify_and_enable_mfa(
     let auth_user = auth_user
         .ok_or_else(|| AppError::Unauthorized("Not authenticated".to_string()))?
         .0;
+    let live_user = UserStore::find_by_id(DB::Conn(&state.db), &auth_user.user.id)
+        .await?
+        .filter(|user| user.deleted_at.is_none())
+        .ok_or_else(|| AppError::Unauthorized("User is no longer active".to_string()))?;
+    crate::middleware::require_recent_authentication(
+        &state.db,
+        &auth_user,
+        chrono::Duration::minutes(ACCOUNT_SECURITY_REAUTH_WINDOW_MINUTES),
+    )
+    .await?;
 
     let totp_secret = UserTotpSecrets::find()
         .filter(user_totp_secrets::Column::UserId.eq(&auth_user.user.id))
@@ -372,7 +585,7 @@ pub async fn verify_and_enable_mfa(
 
     let mfa_service = MfaService::new();
     let is_valid = mfa_service
-        .verify_totp(&secret, &req.code, &auth_user.user.email)
+        .verify_totp(&secret, &req.code, &live_user.email)
         .map_err(|e| AppError::InternalServerError(format!("Failed to verify TOTP: {}", e)))?;
 
     if !is_valid {
@@ -504,9 +717,18 @@ pub async fn verify_and_enable_mfa(
         });
     }
 
+    // Enabling a factor is a security-boundary change. Revoke every prior
+    // session and issue a fresh session after the factor was proven, so a
+    // setup session cannot outlive the factor state it was created under.
+    let (access_token, refresh_token, expires_in) =
+        issue_post_factor_change_session(&state, &auth_user, &live_user).await?;
+
     Ok(Json(MfaVerifyResponse {
         enabled: true,
         backup_codes: formatted_codes,
+        access_token: Some(access_token),
+        refresh_token: Some(refresh_token),
+        expires_in: Some(expires_in),
     }))
 }
 
@@ -515,10 +737,34 @@ pub async fn disable_mfa(
     State(state): State<AppState>,
     auth_user: Option<axum::extract::Extension<crate::middleware::AuthUser>>,
     request_info: Extension<RequestInfo>,
+    request: Option<Json<MfaConfirmationRequest>>,
 ) -> Result<Json<serde_json::Value>> {
     let auth_user = auth_user
         .ok_or_else(|| AppError::Unauthorized("Not authenticated".to_string()))?
         .0;
+    let request = request.map(|Json(request)| request).unwrap_or_default();
+    let live_user = UserStore::find_by_id(DB::Conn(&state.db), &auth_user.user.id)
+        .await?
+        .filter(|user| user.deleted_at.is_none())
+        .ok_or_else(|| AppError::Unauthorized("User is no longer active".to_string()))?;
+
+    if !TotpStore::is_enabled(DB::Conn(&state.db), &live_user.id).await? {
+        return Err(AppError::BadRequest("MFA is not enabled".to_string()));
+    }
+
+    crate::middleware::require_recent_authentication(
+        &state.db,
+        &auth_user,
+        chrono::Duration::minutes(ACCOUNT_SECURITY_REAUTH_WINDOW_MINUTES),
+    )
+    .await?;
+    verify_mfa_step_up(
+        &state,
+        &auth_user.user.id,
+        auth_user.claims.org.as_deref(),
+        request.mfa_code.as_deref(),
+    )
+    .await?;
 
     let user_id = auth_user.user.id.clone();
     let event = MfaAuditBuilder::new(&auth_user.user.id, "mfa_disabled")
@@ -557,9 +803,15 @@ pub async fn disable_mfa(
     )
     .await?;
 
+    let (access_token, refresh_token, expires_in) =
+        issue_post_factor_change_session(&state, &auth_user, &live_user).await?;
+
     Ok(Json(serde_json::json!({
         "success": true,
-        "message": "MFA has been disabled"
+        "message": "MFA has been disabled",
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "expires_in": expires_in,
     })))
 }
 
@@ -568,10 +820,26 @@ pub async fn regenerate_backup_codes(
     State(state): State<AppState>,
     auth_user: Option<axum::extract::Extension<crate::middleware::AuthUser>>,
     request_info: Extension<RequestInfo>,
+    request: Option<Json<MfaConfirmationRequest>>,
 ) -> Result<Json<BackupCodesResponse>> {
     let auth_user = auth_user
         .ok_or_else(|| AppError::Unauthorized("Not authenticated".to_string()))?
         .0;
+    let request = request.map(|Json(request)| request).unwrap_or_default();
+
+    crate::middleware::require_recent_authentication(
+        &state.db,
+        &auth_user,
+        chrono::Duration::minutes(ACCOUNT_SECURITY_REAUTH_WINDOW_MINUTES),
+    )
+    .await?;
+    verify_mfa_step_up(
+        &state,
+        &auth_user.user.id,
+        auth_user.claims.org.as_deref(),
+        request.mfa_code.as_deref(),
+    )
+    .await?;
 
     let _totp_secret = UserTotpSecrets::find()
         .filter(user_totp_secrets::Column::UserId.eq(&auth_user.user.id))
@@ -638,6 +906,15 @@ pub async fn regenerate_backup_codes(
         },
     )
     .await?;
+
+    if let Some(current_session_id) = auth_user.current_session_id.as_deref() {
+        SessionStore::delete_all_except_current(
+            DB::Conn(&state.db),
+            &auth_user.user.id,
+            current_session_id,
+        )
+        .await?;
+    }
 
     Ok(Json(BackupCodesResponse {
         backup_codes: formatted_codes,
@@ -951,6 +1228,9 @@ mod backup_code_claim_tests {
 #[derive(Debug, Deserialize)]
 pub struct SetPasswordRequest {
     pub new_password: String,
+    /// Required when MFA is enabled.
+    #[serde(default)]
+    pub mfa_code: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -962,6 +1242,9 @@ pub struct SetPasswordResponse {
 pub struct ChangePasswordRequest {
     pub current_password: String,
     pub new_password: String,
+    /// Required when MFA is enabled.
+    #[serde(default)]
+    pub mfa_code: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1011,21 +1294,49 @@ pub async fn change_password(
         ));
     }
 
+    crate::middleware::require_recent_authentication(
+        &state.db,
+        &auth_user,
+        chrono::Duration::minutes(ACCOUNT_SECURITY_REAUTH_WINDOW_MINUTES),
+    )
+    .await?;
+
+    verify_mfa_step_up(
+        &state,
+        &user.id,
+        auth_user.claims.org.as_deref(),
+        req.mfa_code.as_deref(),
+    )
+    .await?;
+
     let new_password_hash =
         crate::crypto::concurrency::hash_password_bounded(req.new_password.clone()).await?;
-
-    UserStore::update_password_hash(DB::Conn(&state.db), &user.id, &new_password_hash).await?;
-
-    // Optionally revoke all other sessions for security
-    use crate::store::sessions::SessionStore;
-    if let Some(session_id) = &auth_user.current_session_id {
-        SessionStore::delete_all_except_current(DB::Conn(&state.db), &user.id, session_id).await?;
-    } else {
-        tracing::warn!(
-            user_id = %user.id,
-            "Password changed without a bound current session; skipping session revocation"
-        );
-    }
+    let user_id = user.id.clone();
+    let current_session_id = auth_user.current_session_id.clone();
+    with_retrying_transaction(
+        &state.db,
+        #[cfg(feature = "db_sqlite")]
+        &state.db_writer,
+        "change_password",
+        |db| {
+            let user_id = user_id.clone();
+            let new_password_hash = new_password_hash.clone();
+            let current_session_id = current_session_id.clone();
+            Box::pin(async move {
+                UserStore::update_password_hash(db.clone(), &user_id, &new_password_hash).await?;
+                crate::store::password_reset::PasswordResetStore::delete_all_for_user(
+                    db.clone(),
+                    &user_id,
+                )
+                .await?;
+                if let Some(session_id) = current_session_id.as_deref() {
+                    SessionStore::delete_all_except_current(db, &user_id, session_id).await?;
+                }
+                Ok(())
+            })
+        },
+    )
+    .await?;
 
     Ok(Json(ChangePasswordResponse {
         message: "Password changed successfully".to_string(),
@@ -1063,10 +1374,48 @@ pub async fn set_password(
         ));
     }
 
+    crate::middleware::require_recent_authentication(
+        &state.db,
+        &auth_user,
+        chrono::Duration::minutes(ACCOUNT_SECURITY_REAUTH_WINDOW_MINUTES),
+    )
+    .await?;
+    verify_mfa_step_up(
+        &state,
+        &user.id,
+        auth_user.claims.org.as_deref(),
+        req.mfa_code.as_deref(),
+    )
+    .await?;
+
     let password_hash =
         crate::crypto::concurrency::hash_password_bounded(req.new_password.clone()).await?;
-
-    UserStore::update_password_hash(DB::Conn(&state.db), &user.id, &password_hash).await?;
+    let user_id = user.id.clone();
+    let current_session_id = auth_user.current_session_id.clone();
+    with_retrying_transaction(
+        &state.db,
+        #[cfg(feature = "db_sqlite")]
+        &state.db_writer,
+        "set_password",
+        |db| {
+            let user_id = user_id.clone();
+            let password_hash = password_hash.clone();
+            let current_session_id = current_session_id.clone();
+            Box::pin(async move {
+                UserStore::update_password_hash(db.clone(), &user_id, &password_hash).await?;
+                crate::store::password_reset::PasswordResetStore::delete_all_for_user(
+                    db.clone(),
+                    &user_id,
+                )
+                .await?;
+                if let Some(session_id) = current_session_id.as_deref() {
+                    SessionStore::delete_all_except_current(db, &user_id, session_id).await?;
+                }
+                Ok(())
+            })
+        },
+    )
+    .await?;
 
     Ok(Json(SetPasswordResponse {
         message: "Password set successfully".to_string(),
@@ -1120,7 +1469,9 @@ pub async fn get_user(
     Ok(Json(UserResponse {
         id: user.id,
         email: user.email,
-        is_platform_owner: user.is_platform_owner,
+        // A relying party receiving a service-scoped token must not learn or
+        // rely on the user's platform-admin status.
+        is_platform_owner: user.is_platform_owner && auth_user.claims.service.is_none(),
         email_verified_at: user
             .email_verified_at
             .map(|dt| chrono::DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc).to_rfc3339()),
@@ -1148,30 +1499,135 @@ pub async fn update_user(
         .await?
         .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
 
-    // Validate email format if provided
-    if let Some(email) = &req.email {
+    let mut updated_user = user.clone();
+    if let Some(email) = req.email.as_deref().map(str::trim) {
         validate_email_format(email)?;
-
-        // Check if email is already taken by another user
-        if let Some(existing_user) = UserStore::find_by_email_with_context(
-            DB::Conn(&state.db),
-            email,
-            user.org_id.as_deref(),
-        )
-        .await?
-        {
-            if existing_user.id != user.id {
-                return Err(AppError::BadRequest("Email is already taken".to_string()));
+        if email == user.email {
+            // Idempotent no-op; no security-sensitive change occurred.
+        } else {
+            // The configured platform-owner address drives bootstrap and admin
+            // OAuth owner recognition. Changing it only in the database would
+            // make the next restart create a second, passwordless owner for the
+            // stale configured address. Platform owners must change it through
+            // managed platform configuration.
+            if user.is_platform_owner {
+                return Err(AppError::BadRequest(
+                    "Platform owner email changes must be made through managed platform configuration"
+                        .to_string(),
+                ));
             }
+            ensure_email_delivery_configured(&state, "account email changes")?;
+            require_account_security_reauthentication(
+                &state,
+                &auth_user,
+                req.current_password.as_deref(),
+                req.mfa_code.as_deref(),
+            )
+            .await?;
+
+            // Check if email is already taken by another user in this scope.
+            if let Some(existing_user) = UserStore::find_by_email_with_context(
+                DB::Conn(&state.db),
+                email,
+                user.org_id.as_deref(),
+            )
+            .await?
+            {
+                if existing_user.id != user.id {
+                    return Err(AppError::BadRequest("Email is already taken".to_string()));
+                }
+            }
+
+            let verification_token = Uuid::new_v4().to_string();
+            let verification_token_hash = hash_token(&verification_token);
+            let verification_expires_at = Utc::now() + chrono::Duration::hours(24);
+            let email_owned = email.to_string();
+            let user_id = user.id.clone();
+            let current_session_id = auth_user.current_session_id.clone();
+            let db = DB::Conn(&state.db);
+            updated_user = with_retrying_transaction(
+                &state.db,
+                #[cfg(feature = "db_sqlite")]
+                &state.db_writer,
+                "update_account_email",
+                |db| {
+                    let email = email_owned.clone();
+                    let user_id = user_id.clone();
+                    let verification_token_hash = verification_token_hash.clone();
+                    let verification_expires_at = verification_expires_at.naive_utc();
+                    let current_session_id = current_session_id.clone();
+                    Box::pin(async move {
+                        let updated = UserStore::update_email(db.clone(), &user_id, &email).await?;
+                        EmailVerificationStore::delete_all_for_user(db.clone(), &user_id).await?;
+                        crate::store::password_reset::PasswordResetStore::delete_all_for_user(
+                            db.clone(),
+                            &user_id,
+                        )
+                        .await?;
+                        if let Some(session_id) = current_session_id.as_deref() {
+                            SessionStore::delete_all_except_current(
+                                db.clone(),
+                                &user_id,
+                                session_id,
+                            )
+                            .await?;
+                        }
+                        EmailVerificationStore::create(
+                            db,
+                            &user_id,
+                            &verification_token_hash,
+                            &verification_expires_at,
+                        )
+                        .await?;
+                        Ok(updated)
+                    })
+                },
+            )
+            .await?;
+
+            let verification_url = format!(
+                "{}/verify-email?token={}",
+                state.web_client_url.trim_end_matches('/'),
+                verification_token
+            );
+            if let Err(error) = JobQueueService::enqueue_email(
+                db,
+                email,
+                "Verify Your New Email Address",
+                &format!(
+                    "Confirm this email address for your AuthOS account:\n\n{verification_url}\n\nThis link expires in 24 hours."
+                ),
+                None,
+            )
+            .await
+            {
+                tracing::error!(user_id = %user.id, error = %error, "Failed to enqueue account email verification");
+            }
+
+            // Notify the previous address after the change commits. Best effort:
+            // the new address still has to be verified before password login.
+            if let Err(error) = JobQueueService::enqueue_email(
+                DB::Conn(&state.db),
+                &user.email,
+                "Your AuthOS account email was changed",
+                &format!(
+                    "The email address for your AuthOS account was changed to {email}. If you did not request this change, contact your platform administrator immediately."
+                ),
+                None,
+            )
+            .await
+            {
+                tracing::warn!(user_id = %user.id, error = %error, "Failed to enqueue old-address security notification");
+            }
+
+            state.user_cache.invalidate(&user.id).await;
+
+            tracing::info!(
+                user_id = %user.id,
+                "Account email changed; verification and old-address notification queued"
+            );
         }
     }
-
-    // Update user with new email if provided
-    let updated_user = if let Some(email) = &req.email {
-        UserStore::update_email(DB::Conn(&state.db), &user.id, email).await?
-    } else {
-        user
-    };
 
     // Fetch plan and features if user is in an org/service context
     let (plan, features) = if let (Some(org_slug), Some(service_slug)) =
@@ -1424,16 +1880,31 @@ pub async fn revoke_all_devices(
     )
     .await?;
 
+    // "Revoke all devices" is also a session-security action. Removing device
+    // trust without revoking the associated sessions leaves stolen bearer
+    // tokens usable.
+    if let Some(current_session_id) = auth_user.current_session_id.as_deref() {
+        SessionStore::delete_all_except_current(
+            DB::Conn(&state.db),
+            &auth_user.user.id,
+            current_session_id,
+        )
+        .await?;
+    }
+
     tracing::info!(
         user_id = %auth_user.claims.sub,
         revoked_count = revoked_count,
         ip_address = %request_info.ip_address,
         user_agent = %request_info.user_agent,
-        "All devices revoked except current"
+        "All devices and other sessions revoked except current"
     );
 
     Ok(Json(RevokeDeviceResponse {
-        message: format!("{} devices have been revoked", revoked_count),
+        message: format!(
+            "{} devices and other sessions have been revoked",
+            revoked_count
+        ),
         success: true,
     }))
 }
@@ -1604,14 +2075,17 @@ mod password_route_tests {
 
     use crate::audit::actor::AuditHandle;
     use crate::db::DB;
-    use crate::entities::users;
+    use crate::entities::{
+        prelude::{EmailVerificationTokens, Sessions},
+        users,
+    };
     use crate::middleware::AuthUser;
     use crate::rsa_keys::GeneratedKey;
     use crate::services::{
         events::EventDispatcher, metrics::MfaMetricsService, risk_engine::RiskEngine,
     };
     use crate::state::AppState;
-    use crate::store::users::UserStore;
+    use crate::store::{sessions::SessionStore, users::UserStore};
     use base64::{engine::general_purpose::STANDARD, Engine};
     use migration::{Migrator, MigratorTrait};
     use moka::future::Cache;
@@ -1685,7 +2159,7 @@ mod password_route_tests {
             config,
         };
 
-        let auth_user_for = |user: &users::Model| -> AuthUser {
+        let auth_user_for = |user: &users::Model, session_id: String| -> AuthUser {
             let token = jwt_service
                 .create_token(&user.id, &user.email, false, None, None)
                 .expect("token");
@@ -1695,14 +2169,51 @@ mod password_route_tests {
                 permissions: vec![],
                 ip_address: "127.0.0.1".to_string(),
                 user_agent: "password-test".to_string(),
-                current_session_id: None,
+                current_session_id: Some(session_id),
             }
         };
 
+        let oauth_token = jwt_service
+            .create_token(&oauth_model.id, &oauth_model.email, false, None, None)
+            .expect("oauth token");
+        let oauth_session = SessionStore::create(
+            DB::Conn(&db),
+            &oauth_model.id,
+            &JwtService::hash_token(&oauth_token),
+            (Utc::now() + chrono::Duration::hours(1)).naive_utc(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("password-test"),
+            Some("127.0.0.1"),
+        )
+        .await
+        .expect("oauth session");
+        let pw_token = jwt_service
+            .create_token(&pw_model.id, &pw_model.email, false, None, None)
+            .expect("pw token");
+        let pw_session = SessionStore::create(
+            DB::Conn(&db),
+            &pw_model.id,
+            &JwtService::hash_token(&pw_token),
+            (Utc::now() + chrono::Duration::hours(1)).naive_utc(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("password-test"),
+            Some("127.0.0.1"),
+        )
+        .await
+        .expect("pw session");
+
         Fixture {
             state,
-            oauth_user: auth_user_for(&oauth_model),
-            pw_user: auth_user_for(&pw_model),
+            oauth_user: auth_user_for(&oauth_model, oauth_session.id),
+            pw_user: auth_user_for(&pw_model, pw_session.id),
             current_password,
         }
     }
@@ -1726,6 +2237,7 @@ mod password_route_tests {
             Some(axum::Extension(f.oauth_user.clone())),
             Json(SetPasswordRequest {
                 new_password: "short".to_string(),
+                mfa_code: None,
             }),
         )
         .await
@@ -1740,6 +2252,7 @@ mod password_route_tests {
             Some(axum::Extension(f.oauth_user.clone())),
             Json(SetPasswordRequest {
                 new_password: "long-enough-1".to_string(),
+                mfa_code: None,
             }),
         )
         .await
@@ -1751,6 +2264,7 @@ mod password_route_tests {
             Some(axum::Extension(f.oauth_user.clone())),
             Json(SetPasswordRequest {
                 new_password: "another-pass-9".to_string(),
+                mfa_code: None,
             }),
         )
         .await
@@ -1758,6 +2272,96 @@ mod password_route_tests {
             Err(AppError::BadRequest(message)) => assert!(message.contains("already set")),
             other => panic!("expected BadRequest, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn account_email_change_requires_step_up_and_clears_verification() {
+        let mut f = fixture().await;
+        f.state.email_service = Some(Arc::new(
+            crate::email::EmailService::from_config(crate::email::SmtpConfig {
+                host: "127.0.0.1".to_string(),
+                port: 25,
+                username: String::new(),
+                password: String::new(),
+                from_email: "no-reply@example.test".to_string(),
+                from_name: "AuthOS Test".to_string(),
+            })
+            .expect("test email service"),
+        ));
+        let user_id = f.pw_user.user.id.clone();
+        let other_token = f
+            .state
+            .jwt_service
+            .create_token(&user_id, &f.pw_user.user.email, false, None, None)
+            .expect("other token");
+        SessionStore::create(
+            DB::Conn(&f.state.db),
+            &user_id,
+            &JwtService::hash_token(&other_token),
+            (Utc::now() + chrono::Duration::hours(1)).naive_utc(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("other-browser"),
+            Some("127.0.0.2"),
+        )
+        .await
+        .expect("other session");
+
+        match update_user(
+            State(f.state.clone()),
+            Some(axum::Extension(f.pw_user.clone())),
+            Json(UpdateUserRequest {
+                email: Some("pw-user-new@example.test".to_string()),
+                current_password: None,
+                mfa_code: None,
+            }),
+        )
+        .await
+        {
+            Err(AppError::Forbidden(message)) => assert!(message.contains("Current password")),
+            other => panic!("expected step-up refusal, got {other:?}"),
+        }
+
+        let Json(updated) = update_user(
+            State(f.state.clone()),
+            Some(axum::Extension(f.pw_user.clone())),
+            Json(UpdateUserRequest {
+                email: Some("pw-user-new@example.test".to_string()),
+                current_password: Some(f.current_password.clone()),
+                mfa_code: None,
+            }),
+        )
+        .await
+        .expect("email change after step-up");
+
+        assert_eq!(updated.email, "pw-user-new@example.test");
+        assert!(updated.email_verified_at.is_none());
+        let stored = UserStore::find_by_id(DB::Conn(&f.state.db), &user_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.email, "pw-user-new@example.test");
+        assert!(stored.email_verified_at.is_none());
+        assert_eq!(
+            EmailVerificationTokens::find()
+                .filter(crate::entities::email_verification_tokens::Column::UserId.eq(&user_id))
+                .count(&f.state.db)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            Sessions::find()
+                .filter(crate::entities::sessions::Column::UserId.eq(&user_id))
+                .count(&f.state.db)
+                .await
+                .unwrap(),
+            1,
+            "other sessions must be revoked by an email change"
+        );
     }
 
     #[tokio::test]
@@ -1771,6 +2375,7 @@ mod password_route_tests {
             Json(ChangePasswordRequest {
                 current_password: "wrong-password".to_string(),
                 new_password: "brand-new-pw-1".to_string(),
+                mfa_code: None,
             }),
         )
         .await
@@ -1786,6 +2391,7 @@ mod password_route_tests {
             Json(ChangePasswordRequest {
                 current_password: "whatever".to_string(),
                 new_password: "brand-new-pw-1".to_string(),
+                mfa_code: None,
             }),
         )
         .await
@@ -1803,6 +2409,7 @@ mod password_route_tests {
             Json(ChangePasswordRequest {
                 current_password: f.current_password.clone(),
                 new_password: "brand-new-pw-1".to_string(),
+                mfa_code: None,
             }),
         )
         .await
@@ -1847,7 +2454,7 @@ mod mfa_flow_tests {
         events::EventDispatcher, metrics::MfaMetricsService, risk_engine::RiskEngine,
     };
     use crate::state::AppState;
-    use crate::store::users::UserStore;
+    use crate::store::{sessions::SessionStore, users::UserStore};
     use axum::Extension;
 
     use migration::{Migrator, MigratorTrait};
@@ -1912,13 +2519,28 @@ mod mfa_flow_tests {
         let token = jwt_service
             .create_token(&user_model.id, &user_model.email, false, None, None)
             .expect("token");
+        let session = SessionStore::create(
+            DB::Conn(&db),
+            &user_model.id,
+            &crate::crypto::jwt::JwtService::hash_token(&token),
+            (Utc::now() + chrono::Duration::hours(1)).naive_utc(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("mfa-test"),
+            Some("127.0.0.1"),
+        )
+        .await
+        .expect("mfa session");
         let auth_user = AuthUser {
             claims: jwt_service.validate_token(&token).expect("claims"),
             user: user_model,
             permissions: vec![],
             ip_address: "127.0.0.1".to_string(),
             user_agent: "mfa-test".to_string(),
-            current_session_id: None,
+            current_session_id: Some(session.id),
         };
 
         Fixture {
@@ -1937,6 +2559,7 @@ mod mfa_flow_tests {
             State(f.state.clone()),
             Some(axum::Extension(f.user.clone())),
             request_info(),
+            None,
         )
         .await
         .expect("setup mfa");
@@ -1973,11 +2596,54 @@ mod mfa_flow_tests {
         .await
         .expect("verify and enable");
         assert!(!verified.backup_codes.is_empty());
+        let new_access_token = verified.access_token.expect("post-MFA access token");
+        assert!(verified.refresh_token.is_some());
+        assert_eq!(
+            f.state
+                .jwt_service
+                .validate_token(&new_access_token)
+                .expect("post-MFA claims")
+                .mfa_verified,
+            Some(true),
+            "the rotated session must carry proof of MFA completion"
+        );
+        let new_session = SessionStore::find_by_token_hash(
+            DB::Conn(&f.state.db),
+            &crate::crypto::jwt::JwtService::hash_token(&new_access_token),
+        )
+        .await
+        .expect("load post-MFA session")
+        .expect("post-MFA session exists");
+        let user_after_mfa = AuthUser {
+            claims: f
+                .state
+                .jwt_service
+                .validate_token(&new_access_token)
+                .expect("post-MFA claims"),
+            user: f.user.user.clone(),
+            permissions: vec![],
+            ip_address: "127.0.0.1".to_string(),
+            user_agent: "mfa-test".to_string(),
+            current_session_id: Some(new_session.id),
+        };
+
+        // Active factors must be disabled before a new factor can be enrolled.
+        match setup_mfa(
+            State(f.state.clone()),
+            Some(axum::Extension(f.user.clone())),
+            request_info(),
+            None,
+        )
+        .await
+        {
+            Err(AppError::BadRequest(message)) => assert!(message.contains("already enabled")),
+            other => panic!("expected active-factor refusal, got {other:?}"),
+        }
 
         // Status now reports enabled.
         let Json(status) = get_mfa_status(
             State(f.state.clone()),
-            Some(axum::Extension(f.user.clone())),
+            Some(axum::Extension(user_after_mfa.clone())),
         )
         .await
         .expect("status");
@@ -1985,23 +2651,54 @@ mod mfa_flow_tests {
         assert!(status.has_backup_codes);
 
         // Regenerating backup codes requires enabled MFA and succeeds here.
+        let regeneration_code = mfa_service
+            .create_totp(&setup.secret, &f.user.user.email)
+            .expect("regeneration totp")
+            .generate_current()
+            .expect("regeneration code");
         let Json(new_codes) = regenerate_backup_codes(
             State(f.state.clone()),
-            Some(axum::Extension(f.user.clone())),
+            Some(axum::Extension(user_after_mfa.clone())),
             request_info(),
+            Some(Json(MfaConfirmationRequest {
+                mfa_code: Some(regeneration_code),
+            })),
         )
         .await
         .expect("regenerate backup codes");
         assert!(!new_codes.backup_codes.is_empty());
 
-        // Disabling clears the secret.
-        let _ = disable_mfa(
+        // Disabling without the current factor is refused.
+        match disable_mfa(
             State(f.state.clone()),
-            Some(axum::Extension(f.user.clone())),
+            Some(axum::Extension(user_after_mfa.clone())),
             request_info(),
+            None,
+        )
+        .await
+        {
+            Err(AppError::Forbidden(message)) => assert!(message.contains("MFA code")),
+            other => panic!("expected MFA step-up refusal, got {other:?}"),
+        }
+
+        // Disabling clears the secret.
+        let disable_code = mfa_service
+            .create_totp(&setup.secret, &f.user.user.email)
+            .expect("disable totp")
+            .generate_current()
+            .expect("disable code");
+        let Json(disabled) = disable_mfa(
+            State(f.state.clone()),
+            Some(axum::Extension(user_after_mfa)),
+            request_info(),
+            Some(Json(MfaConfirmationRequest {
+                mfa_code: Some(disable_code),
+            })),
         )
         .await
         .expect("disable mfa");
+        assert_eq!(disabled["success"], true);
+        assert!(disabled["access_token"].as_str().is_some());
         let Json(after) = get_mfa_status(
             State(f.state.clone()),
             Some(axum::Extension(f.user.clone())),
@@ -2019,6 +2716,7 @@ mod mfa_flow_tests {
             State(f.state.clone()),
             Some(axum::Extension(f.user.clone())),
             request_info(),
+            None,
         )
         .await
         {

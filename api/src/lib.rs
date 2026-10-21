@@ -359,6 +359,7 @@ pub async fn run() -> anyhow::Result<()> {
             loop {
                 interval.tick().await;
                 crate::middleware::EMAIL_RATE_LIMITER.cleanup().await;
+                crate::middleware::LOGIN_ATTEMPT_LIMITER.cleanup().await;
                 crate::middleware::MFA_RATE_LIMITER.cleanup().await;
             }
         });

@@ -150,6 +150,12 @@ pub async fn create_invitation(
             "Insufficient permissions to invite members with this role".to_string(),
         ));
     }
+    // Admin invitations grant every tenant capability. Only an owner may
+    // create them; a custom role with role-management permission may invite
+    // members and custom roles but cannot mint an admin.
+    if req.role == "admin" {
+        crate::middleware::check_org_owner(&state.db, &user.id, &organization.id).await?;
+    }
 
     // Check if email is already a member
     let is_member =

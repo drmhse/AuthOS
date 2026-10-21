@@ -76,6 +76,11 @@ pub struct Claims {
     pub device_code_id: Option<String>, // Bound device authorization context for MFA
     #[serde(skip_serializing_if = "Option::is_none")]
     pub act: Option<Actor>, // Actor claim for impersonation (RFC 8693)
+    /// Marks the one-time platform-bootstrap session that may perform initial
+    /// provisioning before an owner has enrolled MFA. Never set on tenant or
+    /// service tokens.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bootstrap: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aud: Option<String>, // Audience - used for impersonation sessions
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -84,6 +89,23 @@ pub struct Claims {
     pub scope: Option<String>, // OAuth scope string for resource-scoped access tokens
     pub exp: i64, // expiration timestamp
     pub iat: i64, // issued at timestamp
+}
+
+impl Claims {
+    /// Platform authority is only valid for a token minted without tenant or
+    /// service context. The signed audience makes this explicit as well.
+    pub fn is_platform_context(&self) -> bool {
+        self.act.is_none()
+            && self.org.is_none()
+            && self.service.is_none()
+            && self.aud.as_deref() == Some("platform")
+    }
+
+    /// Service-login tokens are user tokens delivered to a relying party. They
+    /// must not be treated as platform or organization-management authority.
+    pub fn is_service_context(&self) -> bool {
+        self.service.is_some()
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -306,6 +328,54 @@ impl JwtService {
         )
     }
 
+    /// Mint a management token after the current request proved the account's
+    /// second factor. The signed marker lets platform routes distinguish an
+    /// MFA-completed login from a passkey-only session that merely has MFA
+    /// enrolled on the account.
+    pub fn create_mfa_verified_token(
+        &self,
+        user_id: &str,
+        email: &str,
+        is_platform_owner: bool,
+        org_slug: Option<&str>,
+        service_slug: Option<&str>,
+    ) -> Result<String> {
+        self.create_management_token_inner(
+            user_id,
+            email,
+            is_platform_owner,
+            org_slug,
+            service_slug,
+            None,
+            None,
+            false,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_mfa_verified_token_with_resource(
+        &self,
+        user_id: &str,
+        email: &str,
+        is_platform_owner: bool,
+        org_slug: Option<&str>,
+        service_slug: Option<&str>,
+        resource: Option<&str>,
+    ) -> Result<String> {
+        self.create_management_token_inner(
+            user_id,
+            email,
+            is_platform_owner,
+            org_slug,
+            service_slug,
+            resource,
+            None,
+            false,
+            true,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn create_token_with_resource_and_scope(
         &self,
@@ -316,6 +386,57 @@ impl JwtService {
         service_slug: Option<&str>,
         resource: Option<&str>,
         scope: Option<&str>,
+    ) -> Result<String> {
+        self.create_management_token_inner(
+            user_id,
+            email,
+            is_platform_owner,
+            org_slug,
+            service_slug,
+            resource,
+            scope,
+            false,
+            false,
+        )
+    }
+
+    /// Mint the one-time bootstrap management session. It carries a signed
+    /// marker so the platform route boundary can permit initial provisioning
+    /// before the owner has enrolled MFA. The marker is never valid on tenant
+    /// or service tokens, and enabling MFA revokes this session.
+    pub fn create_bootstrap_management_token(
+        &self,
+        user_id: &str,
+        email: &str,
+        is_platform_owner: bool,
+        org_slug: Option<&str>,
+        service_slug: Option<&str>,
+    ) -> Result<String> {
+        self.create_management_token_inner(
+            user_id,
+            email,
+            is_platform_owner,
+            org_slug,
+            service_slug,
+            None,
+            None,
+            true,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_management_token_inner(
+        &self,
+        user_id: &str,
+        email: &str,
+        is_platform_owner: bool,
+        org_slug: Option<&str>,
+        service_slug: Option<&str>,
+        resource: Option<&str>,
+        scope: Option<&str>,
+        bootstrap_requested: bool,
+        mfa_verified: bool,
     ) -> Result<String> {
         use uuid::Uuid;
 
@@ -338,6 +459,12 @@ impl JwtService {
         } else {
             TokenUse::ManagementAccess
         };
+        let platform_context = org_slug.is_none() && service_slug.is_none() && resource.is_none();
+        // Never advertise platform authority in a tenant- or service-scoped
+        // token. Platform routes also verify the signed context, but dropping
+        // the claim prevents relying parties from misinterpreting the token.
+        let is_platform_owner = is_platform_owner && platform_context;
+        let bootstrap = (bootstrap_requested && platform_context).then_some(true);
 
         let claims = Claims {
             token_use,
@@ -349,10 +476,11 @@ impl JwtService {
             service: service_slug.map(std::string::ToString::to_string),
             // Removed: plan, features, permissions - fetched from cache
             mfa_required: None,
-            mfa_verified: None,
+            mfa_verified: mfa_verified.then_some(true),
             saml_state: None,
             device_code_id: None,
             act: None,
+            bootstrap,
             aud,
             iss: Some(self.issuer.clone()),
             scope: scope.map(std::string::ToString::to_string),
@@ -489,6 +617,8 @@ impl JwtService {
         let aud = resource
             .map(std::string::ToString::to_string)
             .or_else(|| Self::audience_for(org_slug, service_slug));
+        let is_platform_owner =
+            is_platform_owner && org_slug.is_none() && service_slug.is_none() && resource.is_none();
 
         let claims = Claims {
             token_use: TokenUse::MfaPreauth,
@@ -503,6 +633,7 @@ impl JwtService {
             saml_state: saml_state.map(std::string::ToString::to_string),
             device_code_id: device_code_id.map(str::to_string),
             act: None,
+            bootstrap: None,
             aud,
             iss: Some(self.issuer.clone()),
             scope: None,
@@ -625,19 +756,26 @@ impl JwtService {
     fn validate_profile_invariants(&self, claims: &Claims, token_use: TokenUse) -> Result<()> {
         let valid = match token_use {
             TokenUse::ManagementAccess => {
+                let bootstrap_valid = claims.bootstrap.is_none()
+                    || (claims.bootstrap == Some(true)
+                        && claims.org.is_none()
+                        && claims.service.is_none()
+                        && claims.aud.as_deref() == Some("platform"));
                 claims.act.is_none()
                     && claims.device_code_id.is_none()
                     && claims.mfa_required.is_none()
-                    && claims.mfa_verified.is_none()
+                    && matches!(claims.mfa_verified, None | Some(true))
                     && claims.scope.is_none()
+                    && bootstrap_valid
                     && claims.aud
                         == Self::audience_for(claims.org.as_deref(), claims.service.as_deref())
             }
             TokenUse::ExternalResourceAccess => {
                 claims.act.is_none()
+                    && claims.bootstrap.is_none()
                     && claims.device_code_id.is_none()
                     && claims.mfa_required.is_none()
-                    && claims.mfa_verified.is_none()
+                    && matches!(claims.mfa_verified, None | Some(true))
             }
             TokenUse::MfaPreauth => {
                 let expected_management_audience =
@@ -649,6 +787,7 @@ impl JwtService {
                     )
                     .is_some();
                 claims.act.is_none()
+                    && claims.bootstrap.is_none()
                     && claims.mfa_required == Some(true)
                     && claims.mfa_verified == Some(false)
                     && claims.scope.is_none()
@@ -656,6 +795,7 @@ impl JwtService {
             }
             TokenUse::Impersonation => {
                 claims.act.is_some()
+                    && claims.bootstrap.is_none()
                     && claims.device_code_id.is_none()
                     && claims.mfa_required.is_none()
                     && claims.mfa_verified.is_none()
@@ -692,12 +832,14 @@ impl JwtService {
         let now = Utc::now();
         // Impersonation tokens have shorter TTL (15 minutes)
         let exp = now + Duration::minutes(15);
+        let is_platform_owner =
+            is_target_platform_owner && org_slug.is_none() && service_slug.is_none();
 
         let claims = Claims {
             token_use: TokenUse::Impersonation,
             sub: target_user_id.to_string(),
             email: target_user_email.to_string(),
-            is_platform_owner: is_target_platform_owner,
+            is_platform_owner,
             jti: Uuid::new_v4().to_string(),
             org: org_slug.map(std::string::ToString::to_string),
             service: service_slug.map(std::string::ToString::to_string),
@@ -710,6 +852,7 @@ impl JwtService {
                 email: admin_user_email.to_string(),
                 reason: reason.map(std::string::ToString::to_string),
             }),
+            bootstrap: None,
             aud: Some("impersonation-session".to_string()),
             iss: Some(self.issuer.clone()),
             scope: None,
@@ -900,6 +1043,83 @@ mod tests {
         assert!(jwt_service
             .validate_authos_token(&impersonation_token)
             .is_ok());
+    }
+
+    #[test]
+    fn platform_authority_is_only_claimed_in_platform_context() {
+        let service = generated_test_service();
+        let platform = service
+            .create_token("user", "user@example.com", true, None, None)
+            .expect("platform token");
+        let platform_claims = service.validate_management_token(&platform).unwrap();
+        assert!(platform_claims.is_platform_context());
+        assert!(platform_claims.is_platform_owner);
+
+        for (org, svc) in [
+            (Some("acme"), None),
+            (Some("acme"), Some("portal")),
+            (None, Some("portal")),
+        ] {
+            let token = service
+                .create_token("user", "user@example.com", true, org, svc)
+                .expect("tenant token");
+            let claims = service.validate_management_token(&token).unwrap();
+            assert!(!claims.is_platform_context(), "{org:?}/{svc:?}");
+            assert!(!claims.is_platform_owner, "{org:?}/{svc:?}");
+        }
+    }
+
+    #[test]
+    fn mfa_verified_marker_is_only_set_by_the_mfa_completion_flow() {
+        let service = generated_test_service();
+        let ordinary = service
+            .create_token("user", "user@example.com", true, None, None)
+            .expect("ordinary token");
+        let ordinary_claims = service.validate_management_token(&ordinary).unwrap();
+        assert_eq!(ordinary_claims.mfa_verified, None);
+
+        let verified = service
+            .create_mfa_verified_token("user", "user@example.com", true, None, None)
+            .expect("mfa-verified token");
+        let verified_claims = service.validate_management_token(&verified).unwrap();
+        assert_eq!(verified_claims.mfa_verified, Some(true));
+        assert!(verified_claims.is_platform_context());
+        assert!(verified_claims.is_platform_owner);
+
+        let resource = service
+            .create_mfa_verified_token_with_resource(
+                "user",
+                "user@example.com",
+                false,
+                Some("acme"),
+                Some("portal"),
+                Some("https://resource.example.test"),
+            )
+            .expect("mfa-verified resource token");
+        let resource_claims = service
+            .validate_token_for_audience(&resource, "https://resource.example.test")
+            .expect("resource token validates");
+        assert_eq!(resource_claims.mfa_verified, Some(true));
+    }
+
+    #[test]
+    fn bootstrap_marker_is_platform_only() {
+        let service = generated_test_service();
+        let bootstrap = service
+            .create_bootstrap_management_token("user", "user@example.com", true, None, None)
+            .expect("bootstrap token");
+        let claims = service.validate_management_token(&bootstrap).unwrap();
+        assert_eq!(claims.bootstrap, Some(true));
+        assert!(claims.is_platform_context());
+        assert!(claims.is_platform_owner);
+
+        let tenant = service
+            .create_bootstrap_management_token("user", "user@example.com", true, Some("acme"), None)
+            .expect("tenant bootstrap attempt");
+        let claims = service.validate_management_token(&tenant).unwrap();
+        assert_eq!(claims.bootstrap, None);
+        assert!(!claims.is_platform_context());
+        assert!(!claims.is_platform_owner);
     }
 
     #[test]

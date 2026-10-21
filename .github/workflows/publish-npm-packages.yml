@@ -525,9 +525,11 @@ jobs:
           subject-path: .artifacts/npm-packages/authos-cli.tgz
           sbom-path: .artifacts/npm-packages/authos-cli.spdx.json
 
+      # Trusted publishing: npm exchanges this job's GitHub OIDC token (id-token:
+      # write above) for a one-off publish credential, so no long-lived npm token
+      # exists to expire or leak. Each package trusts drmhse/AuthOS release.yml,
+      # the workflow that calls this one.
       - name: Publish all exact npm artifacts
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail

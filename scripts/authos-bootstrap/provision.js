@@ -45,6 +45,11 @@ async function loginPlatformOwner(baseUrl, email, password) {
   if (!response.access_token) {
     throw new Error('Platform owner login did not return an access token');
   }
+  if (!response.refresh_token) {
+    throw new Error(
+      'Platform owner MFA is enabled. Complete MFA or use the standalone installer/bootstrap recovery flow before provisioning.',
+    );
+  }
   return response.access_token;
 }
 

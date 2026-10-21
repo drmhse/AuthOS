@@ -4,7 +4,7 @@ AuthOS uses one public release identity for coordinated artifacts: an annotated
 Git tag in the exact form `vMAJOR.MINOR.PATCH`. Prerelease and build
 metadata tags are rejected because the current publication path advances npm,
 GitHub, and Docker `latest` pointers. The latest published release at this
-document's baseline is `v0.8.13`.
+document's baseline is `v0.8.14`.
 
 ## Version sources
 
@@ -37,7 +37,9 @@ documented current release, and bootstrap Docker pins.
 3. A `vX.Y.Z` tag starts one orchestrated release workflow. Read-only jobs
    prepare every standalone, OCI, and npm artifact; one cross-channel preflight
    then requires all immutable npm and Docker versions to be absent and the
-   candidate to be newer than the current GitHub/npm `latest` versions.
+   candidate to be newer than the current GitHub/npm `latest` versions. npm
+   publication uses GitHub OIDC trusted publishing, not a long-lived registry
+   token.
 4. Only after that gate succeeds does the workflow create a draft GitHub
    release and invoke small artifact-only publication jobs. Source builds do
    not receive registry credentials, a contents-write token, or OIDC authority.

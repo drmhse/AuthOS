@@ -3600,6 +3600,26 @@ fn require_google_verified_email(verified_email: Option<bool>) -> Result<()> {
     ))
 }
 
+/// GitHub's `/user` email field is not an authorization assertion. Always
+/// resolve the verified primary address (or a verified exact match for the
+/// public address) from `/user/emails`, which requires the `user:email` scope.
+fn select_github_verified_email(
+    public_email: Option<&str>,
+    emails: &[(String, bool, bool)],
+) -> Option<String> {
+    if let Some((email, _, _)) = emails
+        .iter()
+        .find(|(_, primary, verified)| *primary && *verified)
+    {
+        return Some(email.clone());
+    }
+    let public_email = public_email?;
+    emails
+        .iter()
+        .find(|(email, _, verified)| *verified && email.eq_ignore_ascii_case(public_email))
+        .map(|(email, _, _)| email.clone())
+}
+
 /// Get user info from provider (standalone, not using OAuth client for BYOO isolation)
 async fn get_provider_user_info(
     provider: Provider,
@@ -3664,24 +3684,19 @@ async fn get_provider_user_info(
                 true,
             )
             .await?;
-
-            let email = if let Some(email) = user.email {
-                email
-            } else {
-                let emails: Vec<GithubEmail> = fetch_json(
-                    &client,
-                    &config.get_github_user_emails_api_url(),
-                    access_token,
-                    true,
-                )
-                .await?;
-
-                emails
-                    .into_iter()
-                    .find(|e| e.primary && e.verified)
-                    .map(|e| e.email)
-                    .ok_or_else(|| AppError::OAuth("No verified email found".to_string()))?
-            };
+            let emails: Vec<GithubEmail> = fetch_json(
+                &client,
+                &config.get_github_user_emails_api_url(),
+                access_token,
+                true,
+            )
+            .await?;
+            let email_claims = emails
+                .into_iter()
+                .map(|email| (email.email, email.primary, email.verified))
+                .collect::<Vec<_>>();
+            let email = select_github_verified_email(user.email.as_deref(), &email_claims)
+                .ok_or_else(|| AppError::OAuth("No verified email found".to_string()))?;
 
             Ok(crate::crypto::sso::UserInfo {
                 provider_user_id: user.id.to_string(),
@@ -3734,7 +3749,10 @@ async fn get_provider_user_info(
             )
             .await?;
 
-            let email = user.mail.or(user.user_principal_name).ok_or_else(|| {
+            // UPN is the account's sign-in identifier. Prefer it over the
+            // mutable `mail` attribute, which a tenant administrator can set
+            // independently of the login identity.
+            let email = user.user_principal_name.or(user.mail).ok_or_else(|| {
                 AppError::OAuth("Microsoft user profile did not include an email".to_string())
             })?;
 
@@ -4889,6 +4907,32 @@ mod tests {
         let scopes = normalized_granted_scopes(Provider::Microsoft, &requested, &returned, None);
 
         assert!(!scopes.iter().any(|scope| scope == "offline_access"));
+    }
+
+    #[test]
+    fn github_identity_requires_a_verified_email() {
+        let emails = vec![
+            ("public-unverified@example.com".to_string(), false, false),
+            ("secondary@example.com".to_string(), false, true),
+            ("primary@example.com".to_string(), true, true),
+        ];
+        assert_eq!(
+            select_github_verified_email(Some("public-unverified@example.com"), &emails).as_deref(),
+            Some("primary@example.com")
+        );
+
+        let no_primary = vec![
+            ("public-verified@example.com".to_string(), false, true),
+            ("other@example.com".to_string(), false, true),
+        ];
+        assert_eq!(
+            select_github_verified_email(Some("public-verified@example.com"), &no_primary)
+                .as_deref(),
+            Some("public-verified@example.com")
+        );
+
+        let unverified = vec![("public@example.com".to_string(), false, false)];
+        assert!(select_github_verified_email(Some("public@example.com"), &unverified).is_none());
     }
 
     #[test]

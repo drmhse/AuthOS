@@ -5,7 +5,8 @@ use crate::handlers::auth::session::RefreshTokenResponse;
 use crate::middleware::{AuthUser, RequestInfo};
 use crate::state::AppState;
 use crate::store::{
-    distributed_locks::DistributedLockStore, sessions::SessionStore, users::UserStore,
+    distributed_locks::DistributedLockStore, sessions::SessionStore, totp::TotpStore,
+    users::UserStore,
 };
 use axum::{extract::State, Extension, Json};
 use chrono::Utc;
@@ -105,8 +106,10 @@ pub async fn apply_managed_config(
 pub async fn bootstrap_login(
     State(state): State<AppState>,
     Extension(request_info): Extension<RequestInfo>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<BootstrapLoginRequest>,
 ) -> Result<Json<RefreshTokenResponse>> {
+    crate::middleware::ensure_trusted_platform_origin(&headers, &state.config)?;
     if req.token.trim().is_empty() {
         return Err(AppError::BadRequest(
             "Bootstrap token is required".to_string(),
@@ -132,6 +135,7 @@ pub async fn bootstrap_login(
     })?;
     let user = UserStore::find_by_email_with_context(DB::Conn(&state.db), owner_email, None)
         .await?
+        .filter(|user| user.deleted_at.is_none())
         .ok_or_else(|| AppError::Unauthorized("Platform owner user does not exist".to_string()))?;
 
     if !user.is_platform_owner {
@@ -140,9 +144,38 @@ pub async fn bootstrap_login(
         ));
     }
 
-    let access_token = state
-        .jwt_service
-        .create_token(&user.id, &user.email, true, None, None)?;
+    // A browser bootstrap link is a recovery credential, not an MFA bypass.
+    // The standalone installer calls this endpoint without an Origin header
+    // and needs a narrow local provisioning session even after MFA is enrolled.
+    let browser_request = headers.contains_key(axum::http::header::ORIGIN);
+    if browser_request && TotpStore::is_enabled(DB::Conn(&state.db), &user.id).await? {
+        let preauth_token = state.jwt_service.create_mfa_preauth_token(
+            &user.id,
+            &user.email,
+            true,
+            None,
+            None,
+            None,
+        )?;
+        token_state.insert(
+            "used_at".to_string(),
+            Value::String(Utc::now().to_rfc3339()),
+        );
+        write_json_file(&paths.state_path, &managed_state)?;
+        return Ok(Json(RefreshTokenResponse {
+            access_token: preauth_token,
+            refresh_token: String::new(),
+            expires_in: 300,
+        }));
+    }
+
+    let access_token = state.jwt_service.create_bootstrap_management_token(
+        &user.id,
+        &user.email,
+        true,
+        None,
+        None,
+    )?;
     let refresh_token = crate::crypto::refresh_tokens::generate();
     let expires_at =
         (Utc::now() + chrono::Duration::hours(state.config.jwt_expiration_hours)).naive_utc();

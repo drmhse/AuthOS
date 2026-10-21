@@ -80,6 +80,42 @@ impl SessionStore {
         user_agent: Option<&str>,
         ip_address: Option<&str>,
     ) -> Result<sessions::Model> {
+        Self::create_with_created_at(
+            db,
+            user_id,
+            token_hash,
+            expires_at,
+            refresh_token,
+            refresh_token_expires_at,
+            org_slug,
+            service_id,
+            resource,
+            user_agent,
+            ip_address,
+            chrono::Utc::now().naive_utc(),
+        )
+        .await
+    }
+
+    /// Create a session with an explicit authentication time. Context-switch
+    /// flows that mint a new session without re-entering credentials must carry
+    /// the original session's authentication time forward so recent-auth
+    /// step-up checks cannot be reset by an attacker holding a stolen token.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_with_created_at(
+        db: DB<'_>,
+        user_id: &str,
+        token_hash: &str,
+        expires_at: NaiveDateTime,
+        refresh_token: Option<&str>,
+        refresh_token_expires_at: Option<NaiveDateTime>,
+        org_slug: Option<&str>,
+        service_id: Option<&str>,
+        resource: Option<&str>,
+        user_agent: Option<&str>,
+        ip_address: Option<&str>,
+        created_at: NaiveDateTime,
+    ) -> Result<sessions::Model> {
         let new_session = sessions::ActiveModel {
             id: Set(Uuid::new_v4().to_string()),
             user_id: Set(user_id.to_string()),
@@ -95,6 +131,7 @@ impl SessionStore {
             resource: Set(resource.map(std::string::ToString::to_string)),
             user_agent: Set(user_agent.map(std::string::ToString::to_string)),
             ip_address: Set(ip_address.map(std::string::ToString::to_string)),
+            created_at: Set(created_at),
             ..Default::default()
         };
 

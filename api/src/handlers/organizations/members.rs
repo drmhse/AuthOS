@@ -286,7 +286,12 @@ pub async fn update_member_role(
                 AppError::NotFound("User is not a member of this organization".to_string())
             })?;
 
-    if matches!(membership.role.as_str(), "owner" | "admin") || req.role == "owner" {
+    // Only a current owner may grant admin/owner authority or change an
+    // existing owner/admin. A custom role with role-management capability may
+    // manage member and custom roles, but cannot mint an all-capability admin.
+    if matches!(membership.role.as_str(), "owner" | "admin")
+        || matches!(req.role.as_str(), "owner" | "admin")
+    {
         crate::middleware::check_org_owner(&state.db, &user.id, &organization.id).await?;
     }
 

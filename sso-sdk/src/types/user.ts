@@ -14,6 +14,10 @@ export interface Subscription {
  */
 export interface UpdateUserProfilePayload {
   email?: string;
+  /** Required when the account has a password. */
+  current_password?: string;
+  /** Required when MFA is enabled. */
+  mfa_code?: string;
 }
 
 /**
@@ -92,6 +96,8 @@ export interface CompleteProviderTokenRequestResponse {
 export interface ChangePasswordRequest {
   current_password: string;
   new_password: string;
+  /** Required when MFA is enabled. */
+  mfa_code?: string;
 }
 
 /**
@@ -106,6 +112,8 @@ export interface ChangePasswordResponse {
  */
 export interface SetPasswordRequest {
   new_password: string;
+  /** Required when MFA is enabled. */
+  mfa_code?: string;
 }
 
 /**
@@ -139,12 +147,35 @@ export interface MfaVerifyRequest {
   code: string;
 }
 
+export interface MfaSetupRequest {
+  /** Required when the account already has a password. */
+  current_password?: string;
+}
+
+export interface MfaConfirmationRequest {
+  /** Current TOTP or backup code. */
+  mfa_code: string;
+}
+
 /**
  * MFA verify response
  */
 export interface MfaVerifyResponse {
   enabled: boolean;
   backup_codes: string[];
+  /** Fresh session credentials after the factor change. */
+  access_token?: string;
+  refresh_token?: string;
+  expires_in?: number;
+}
+
+export interface MfaDisableResponse {
+  success: boolean;
+  message: string;
+  /** Fresh session credentials after the factor change. */
+  access_token?: string;
+  refresh_token?: string;
+  expires_in?: number;
 }
 
 /**

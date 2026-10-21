@@ -1,5 +1,5 @@
 import { HttpClient } from '../http';
-import { UserProfile, UpdateUserProfilePayload, Subscription, Identity, StartLinkResponse, ChangePasswordRequest, ChangePasswordResponse, SetPasswordRequest, SetPasswordResponse, MfaStatusResponse, MfaSetupResponse, MfaVerifyResponse, BackupCodesResponse, UserDevice, ListDevicesResponse, RevokeDeviceResponse, LinkedAccountsResponse, GrantLinkedAccountRequest, LinkedAccountGrant, ProviderTokenRequestDetails, CompleteProviderTokenRequestPayload, CompleteProviderTokenRequestResponse } from '../types';
+import { UserProfile, UpdateUserProfilePayload, Subscription, Identity, StartLinkResponse, ChangePasswordRequest, ChangePasswordResponse, SetPasswordRequest, SetPasswordResponse, MfaStatusResponse, MfaSetupResponse, MfaVerifyResponse, MfaSetupRequest, MfaConfirmationRequest, MfaDisableResponse, BackupCodesResponse, UserDevice, ListDevicesResponse, RevokeDeviceResponse, LinkedAccountsResponse, GrantLinkedAccountRequest, LinkedAccountGrant, ProviderTokenRequestDetails, CompleteProviderTokenRequestPayload, CompleteProviderTokenRequestResponse } from '../types';
 
 /**
  * Identity (social account linking) methods
@@ -132,13 +132,15 @@ class MfaModule {
    *
    * @example
    * ```typescript
-   * const setup = await sso.user.mfa.setup();
+   * const setup = await sso.user.mfa.setup({
+   *   current_password: 'account-password-if-present',
+   * });
    * console.log(setup.qr_code_svg); // Display this QR code to the user
    * // User scans QR code with authenticator app and enters code to verify
    * ```
    */
-  public async setup(): Promise<MfaSetupResponse> {
-    const response = await this.http.post<MfaSetupResponse>('/api/user/mfa/setup', {});
+  public async setup(payload: MfaSetupRequest = {}): Promise<MfaSetupResponse> {
+    const response = await this.http.post<MfaSetupResponse>('/api/user/mfa/setup', payload);
     return response.data;
   }
 
@@ -165,11 +167,11 @@ class MfaModule {
    *
    * @example
    * ```typescript
-   * await sso.user.mfa.disable();
+   * await sso.user.mfa.disable({ mfa_code: '123456' });
    * ```
    */
-  public async disable(): Promise<{ success: boolean; message: string }> {
-    const response = await this.http.delete<{ success: boolean; message: string }>('/api/user/mfa');
+  public async disable(payload: MfaConfirmationRequest): Promise<MfaDisableResponse> {
+    const response = await this.http.delete<MfaDisableResponse>('/api/user/mfa', payload);
     return response.data;
   }
 
@@ -181,12 +183,14 @@ class MfaModule {
    *
    * @example
    * ```typescript
-   * const { backup_codes } = await sso.user.mfa.regenerateBackupCodes();
+   * const { backup_codes } = await sso.user.mfa.regenerateBackupCodes({
+   *   mfa_code: '123456',
+   * });
    * console.log(backup_codes); // Store these securely!
    * ```
    */
-  public async regenerateBackupCodes(): Promise<BackupCodesResponse> {
-    const response = await this.http.post<BackupCodesResponse>('/api/user/mfa/backup-codes/regenerate', {});
+  public async regenerateBackupCodes(payload: MfaConfirmationRequest): Promise<BackupCodesResponse> {
+    const response = await this.http.post<BackupCodesResponse>('/api/user/mfa/backup-codes/regenerate', payload);
     return response.data;
   }
 }
@@ -364,7 +368,9 @@ export class UserModule {
    * @example
    * ```typescript
    * const updated = await sso.user.updateProfile({
-   *   email: 'newemail@example.com'
+   *   email: 'newemail@example.com',
+   *   current_password: 'current-password-if-present',
+   *   mfa_code: '123456-if-enabled',
    * });
    * ```
    */
@@ -400,7 +406,8 @@ export class UserModule {
    * ```typescript
    * const response = await sso.user.changePassword({
    *   current_password: 'OldPassword123!',
-   *   new_password: 'NewSecurePassword456!'
+   *   new_password: 'NewSecurePassword456!',
+   *   mfa_code: '123456-if-enabled',
    * });
    * console.log(response.message);
    * ```
@@ -421,7 +428,8 @@ export class UserModule {
    * @example
    * ```typescript
    * const response = await sso.user.setPassword({
-   *   new_password: 'MyNewSecurePassword123!'
+   *   new_password: 'MyNewSecurePassword123!',
+   *   mfa_code: '123456-if-enabled',
    * });
    * console.log(response.message); // "Password set successfully"
    * ```

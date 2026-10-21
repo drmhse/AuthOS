@@ -90,6 +90,8 @@ async fn verify_self_delete_authorization(
 async fn require_platform_owner_or_owner_in_all_target_orgs(
     db: DB<'_>,
     requesting_user_id: &str,
+    platform_token_context: bool,
+    platform_mfa_verified: bool,
     target_user_id: &str,
     action: &str,
 ) -> Result<Vec<memberships::Model>> {
@@ -99,7 +101,14 @@ async fn require_platform_owner_or_owner_in_all_target_orgs(
         .ok_or_else(|| AppError::Forbidden("Current user is no longer active".to_string()))?;
     let memberships = MembershipStore::list_by_user(db.clone(), target_user_id).await?;
 
-    if requesting_user.is_platform_owner {
+    if crate::middleware::has_live_platform_authority_in(
+        db.clone(),
+        &requesting_user.id,
+        platform_token_context,
+        platform_mfa_verified,
+    )
+    .await?
+    {
         return Ok(memberships);
     }
 
@@ -283,6 +292,9 @@ pub async fn forget_user(
         )
         .await?;
 
+        state.user_cache.invalidate(&user_id).await;
+        state.permission_cache.invalidate(&user_id).await;
+
         tracing::warn!(
             actor_id = %requesting_user.id,
             target_user_id = %user_id,
@@ -301,12 +313,17 @@ pub async fn forget_user(
     require_platform_owner_or_owner_in_all_target_orgs(
         DB::Conn(&state.db),
         &requesting_user.id,
+        auth_user.claims.is_platform_context(),
+        auth_user.claims.mfa_verified == Some(true) || auth_user.claims.bootstrap == Some(true),
         &user_id,
         "anonymize",
     )
     .await?;
 
     let requesting_user_id = requesting_user.id.clone();
+    let platform_token_context = auth_user.claims.is_platform_context();
+    let platform_mfa_verified =
+        auth_user.claims.mfa_verified == Some(true) || auth_user.claims.bootstrap == Some(true);
     with_retrying_transaction(
         &state.db,
         #[cfg(feature = "db_sqlite")]
@@ -323,6 +340,8 @@ pub async fn forget_user(
                 let memberships = require_platform_owner_or_owner_in_all_target_orgs(
                     db.clone(),
                     &requesting_user_id,
+                    platform_token_context,
+                    platform_mfa_verified,
                     &user_id,
                     "anonymize",
                 )
@@ -373,6 +392,9 @@ pub async fn forget_user(
     )
     .await?;
 
+    state.user_cache.invalidate(&user_id).await;
+    state.permission_cache.invalidate(&user_id).await;
+
     tracing::warn!(
         actor_id = %requesting_user.id,
         target_user_id = %user_id,
@@ -402,6 +424,8 @@ pub async fn export_user_data(
         require_platform_owner_or_owner_in_all_target_orgs(
             DB::Conn(&state.db),
             &requesting_user.id,
+            auth_user.claims.is_platform_context(),
+            auth_user.claims.mfa_verified == Some(true) || auth_user.claims.bootstrap == Some(true),
             &user_id,
             "export",
         )
@@ -411,6 +435,18 @@ pub async fn export_user_data(
     let target_user = UserStore::find_by_id(DB::Conn(&state.db), &user_id)
         .await?
         .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
+
+    // Platform-owner records contain global login and identity metadata. A
+    // tenant owner must not be able to export them merely because the platform
+    // owner is also a member of that tenant.
+    if requesting_user.id != user_id
+        && target_user.is_platform_owner
+        && !crate::middleware::has_live_platform_authority(&state.db, &auth_user).await?
+    {
+        return Err(AppError::Forbidden(
+            "Platform owner data can only be exported by a platform owner".to_string(),
+        ));
+    }
 
     // Get memberships with organization details
     let memberships = MembershipStore::list_by_user(DB::Conn(&state.db), &user_id).await?;
@@ -541,8 +577,24 @@ pub async fn export_user_data(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::entities::{prelude::UserTotpSecrets, user_totp_secrets};
     use migration::{Migrator, MigratorTrait};
-    use sea_orm::Database;
+    use sea_orm::{Database, EntityTrait, Set};
+
+    async fn enroll_test_mfa(db: &sea_orm::DatabaseConnection, user_id: &str) {
+        UserTotpSecrets::insert(user_totp_secrets::ActiveModel {
+            id: Set(format!("totp-{user_id}")),
+            user_id: Set(user_id.to_string()),
+            secret_encrypted: Set(vec![]),
+            encryption_key_id: Set("test-key".to_string()),
+            enabled: Set(true),
+            created_at: Set(Utc::now().naive_utc()),
+            enabled_at: Set(Some(Utc::now().naive_utc())),
+        })
+        .exec(db)
+        .await
+        .expect("enroll test MFA");
+    }
 
     #[tokio::test]
     async fn demoted_cached_platform_owner_cannot_authorize_cross_user_privacy_action() {
@@ -554,6 +606,7 @@ mod tests {
             .await
             .expect("create platform owner");
         let stale_actor = actor.clone();
+        enroll_test_mfa(&db, &actor.id).await;
         let target = UserStore::create(DB::Conn(&db), "privacy-target@example.com", None, false)
             .await
             .expect("create target");
@@ -561,6 +614,8 @@ mod tests {
         require_platform_owner_or_owner_in_all_target_orgs(
             DB::Conn(&db),
             &actor.id,
+            true,
+            true,
             &target.id,
             "export",
         )
@@ -578,6 +633,8 @@ mod tests {
             require_platform_owner_or_owner_in_all_target_orgs(
                 DB::Conn(&db),
                 &actor.id,
+                true,
+                true,
                 &target.id,
                 "export",
             )
@@ -601,7 +658,7 @@ mod privacy_route_tests {
     use crate::billing::providers::disabled::DisabledBillingProvider;
     use crate::crypto::sso::OAuthClient;
 
-    use crate::entities::users;
+    use crate::entities::{prelude::UserTotpSecrets, user_totp_secrets, users};
     use crate::middleware::AuthUser;
 
     use crate::audit::actor::AuditHandle;
@@ -619,7 +676,7 @@ mod privacy_route_tests {
 
     use migration::{Migrator, MigratorTrait};
     use moka::future::Cache;
-    use sea_orm::Database;
+    use sea_orm::{Database, EntityTrait, Set};
     use std::sync::Arc;
 
     use crate::test_support::test_jwt_service;
@@ -655,6 +712,19 @@ mod privacy_route_tests {
         .await
         .expect("create platform owner")
         .0;
+        UserTotpSecrets::insert(user_totp_secrets::ActiveModel {
+            id: Set("privacy-platform-totp".to_string()),
+            user_id: Set(platform_model.id.clone()),
+            secret_encrypted: Set(vec![]),
+            encryption_key_id: Set("test-key".to_string()),
+            enabled: Set(true),
+            created_at: Set(Utc::now().naive_utc()),
+            enabled_at: Set(Some(Utc::now().naive_utc())),
+        })
+        .exec(&db)
+        .await
+        .expect("enroll platform MFA");
+
         let plain_model =
             UserStore::create(DB::Conn(&db), "privacy-plain@example.test", None, false)
                 .await
@@ -706,9 +776,15 @@ mod privacy_route_tests {
         };
 
         let auth_user_for = |user: &users::Model| -> AuthUser {
-            let token = jwt_service
-                .create_token(&user.id, &user.email, user.is_platform_owner, None, None)
-                .expect("token");
+            let token = if user.is_platform_owner {
+                jwt_service
+                    .create_mfa_verified_token(&user.id, &user.email, true, None, None)
+                    .expect("platform token")
+            } else {
+                jwt_service
+                    .create_token(&user.id, &user.email, false, None, None)
+                    .expect("token")
+            };
             AuthUser {
                 claims: jwt_service.validate_token(&token).expect("claims"),
                 user: user.clone(),
@@ -779,6 +855,36 @@ mod privacy_route_tests {
         .await
         .expect("platform export");
         assert_eq!(exported.email, "privacy-plain@example.test");
+    }
+
+    #[tokio::test]
+    async fn tenant_owner_cannot_export_a_platform_owner_member() {
+        let fixture = fixture().await;
+        let org = OrganizationStore::find_by_slug(DB::Conn(&fixture.state.db), "acme")
+            .await
+            .expect("load org")
+            .expect("org exists");
+        MembershipStore::create(
+            DB::Conn(&fixture.state.db),
+            &org.id,
+            &fixture.platform.user.id,
+            "member",
+        )
+        .await
+        .expect("add platform owner to tenant");
+
+        match export_user_data(
+            State(fixture.state.clone()),
+            fixture.member_of_other_org.clone(),
+            Path(fixture.platform.user.id.clone()),
+        )
+        .await
+        {
+            Err(AppError::Forbidden(message)) => {
+                assert!(message.contains("Platform owner"))
+            }
+            other => panic!("expected platform-owner export refusal, got {other:?}"),
+        }
     }
 
     #[tokio::test]

@@ -11,7 +11,11 @@ mod tests {
     use crate::billing::providers::disabled::DisabledBillingProvider;
     use crate::crypto::sso::OAuthClient;
 
-    use crate::entities::{prelude::Users, users};
+    use crate::crypto::jwt::JwtService;
+    use crate::entities::{
+        prelude::{Sessions, Users},
+        users,
+    };
     use crate::handlers::scim::schemas;
     use crate::router;
 
@@ -23,7 +27,8 @@ mod tests {
     use crate::state::AppState;
     use crate::store::{
         memberships::MembershipStore, organizations::OrganizationStore,
-        permissions::PermissionsStore, scim_tokens::ScimTokenStore, users::UserStore,
+        permissions::PermissionsStore, scim_tokens::ScimTokenStore, sessions::SessionStore,
+        users::UserStore,
     };
     use axum::body::{to_bytes, Body};
     use axum::http::{header, HeaderValue, Method, Request, StatusCode};
@@ -31,7 +36,8 @@ mod tests {
     use chrono::Utc;
     use moka::future::Cache;
     use sea_orm::{
-        ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set,
+        ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait,
+        QueryFilter, Set,
     };
     use serde_json::Value;
     use std::sync::Arc;
@@ -416,6 +422,153 @@ mod tests {
         assert_eq!(
             user_email(&fixture.state.db, &fixture.user_id).await,
             "updated@example.com"
+        );
+    }
+
+    #[tokio::test]
+    async fn scim_cannot_modify_platform_owner_or_privileged_identity_email() {
+        let fixture = setup_fixture().await;
+
+        let promoted = UserStore::create_with_org_id(
+            DB::Conn(&fixture.state.db),
+            "promoted-platform@example.com",
+            None,
+            &fixture.org_id,
+        )
+        .await
+        .expect("create tenant-scoped promoted user");
+        MembershipStore::create(
+            DB::Conn(&fixture.state.db),
+            &fixture.org_id,
+            &promoted.id,
+            "member",
+        )
+        .await
+        .expect("promoted membership");
+        UserStore::set_platform_owner(DB::Conn(&fixture.state.db), &promoted.id, true)
+            .await
+            .expect("promote user");
+
+        let (status, _) = scim_request(
+            &fixture,
+            Method::PATCH,
+            format!("/scim/v2/Users/{}", promoted.id),
+            serde_json::json!({
+                "schemas": [schemas::SCIM_PATCH_SCHEMA],
+                "Operations": [{
+                    "op": "replace",
+                    "path": "userName",
+                    "value": "attacker@example.com"
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            user_email(&fixture.state.db, &promoted.id).await,
+            "promoted-platform@example.com"
+        );
+
+        let tenant_owner = UserStore::create_with_org_id(
+            DB::Conn(&fixture.state.db),
+            "tenant-owner-email@example.com",
+            None,
+            &fixture.org_id,
+        )
+        .await
+        .expect("create tenant-scoped owner");
+        MembershipStore::create(
+            DB::Conn(&fixture.state.db),
+            &fixture.org_id,
+            &tenant_owner.id,
+            "owner",
+        )
+        .await
+        .expect("tenant owner membership");
+
+        let (status, _) = scim_request(
+            &fixture,
+            Method::PATCH,
+            format!("/scim/v2/Users/{}", tenant_owner.id),
+            serde_json::json!({
+                "schemas": [schemas::SCIM_PATCH_SCHEMA],
+                "Operations": [{
+                    "op": "replace",
+                    "path": "emails",
+                    "value": [{"value": "attacker@example.com", "primary": true}]
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            user_email(&fixture.state.db, &tenant_owner.id).await,
+            "tenant-owner-email@example.com"
+        );
+    }
+
+    #[tokio::test]
+    async fn scim_email_change_clears_verification_and_revokes_sessions() {
+        let fixture = setup_fixture().await;
+        let mut user: users::ActiveModel =
+            UserStore::find_by_id(DB::Conn(&fixture.state.db), &fixture.user_id)
+                .await
+                .expect("load user")
+                .expect("user exists")
+                .into();
+        user.email_verified_at = Set(Some(Utc::now().naive_utc()));
+        user.update(&fixture.state.db).await.expect("verify email");
+
+        let token = fixture
+            .state
+            .jwt_service
+            .create_token(&fixture.user_id, "scim-user@example.com", false, None, None)
+            .expect("token");
+        SessionStore::create(
+            DB::Conn(&fixture.state.db),
+            &fixture.user_id,
+            &JwtService::hash_token(&token),
+            (Utc::now() + chrono::Duration::hours(1)).naive_utc(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("scim-test"),
+            Some("127.0.0.1"),
+        )
+        .await
+        .expect("session");
+
+        let (status, _) = scim_request(
+            &fixture,
+            Method::PATCH,
+            format!("/scim/v2/Users/{}", fixture.user_id),
+            serde_json::json!({
+                "schemas": [schemas::SCIM_PATCH_SCHEMA],
+                "Operations": [{
+                    "op": "replace",
+                    "path": "userName",
+                    "value": "scim-user-new@example.com"
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let stored = UserStore::find_by_id(DB::Conn(&fixture.state.db), &fixture.user_id)
+            .await
+            .expect("load updated user")
+            .expect("updated user exists");
+        assert_eq!(stored.email, "scim-user-new@example.com");
+        assert!(stored.email_verified_at.is_none());
+        assert_eq!(
+            Sessions::find()
+                .filter(crate::entities::sessions::Column::UserId.eq(&fixture.user_id))
+                .count(&fixture.state.db)
+                .await
+                .expect("count sessions"),
+            0
         );
     }
 

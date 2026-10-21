@@ -30,7 +30,7 @@ const generic = count(
   /enqueue_(?:org|login|mfa|platform)_with_connection\s*\(/g,
 );
 
-const expected = { coupled: 50, standalone: 3, generic: 5 };
+const expected = { coupled: 50, standalone: 4, generic: 5 };
 for (const [kind, actual] of Object.entries({ coupled, standalone, generic })) {
   if (actual !== expected[kind]) {
     throw new Error(
@@ -41,7 +41,7 @@ for (const [kind, actual] of Object.entries({ coupled, standalone, generic })) {
 }
 
 const standaloneAllowlist = new Map([
-  ["api/src/handlers/user.rs", 1],
+  ["api/src/handlers/user.rs", 2],
   ["api/src/handlers/auth/mfa.rs", 1],
   ["api/src/handlers/auth/oauth.rs", 1],
 ]);

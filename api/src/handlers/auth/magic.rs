@@ -7,7 +7,7 @@ use crate::middleware::RequestInfo;
 use crate::state::AppState;
 use crate::store::{
     magic_links::MagicLinksStore, memberships::MembershipStore, organizations::OrganizationStore,
-    services::ServiceStore, sessions::SessionStore, users::UserStore,
+    services::ServiceStore, sessions::SessionStore, totp::TotpStore, users::UserStore,
 };
 use axum::{
     extract::{Query, State},
@@ -472,6 +472,7 @@ pub async fn request_magic_link(
 pub async fn verify_magic_link(
     State(state): State<AppState>,
     Extension(request_info): Extension<RequestInfo>,
+    headers: axum::http::HeaderMap,
     Query(query): Query<VerifyMagicLinkQuery>,
 ) -> Result<impl IntoResponse> {
     let magic_link = MagicLinksStore::find_by_token(DB::Conn(&state.db), &query.token)
@@ -502,6 +503,16 @@ pub async fn verify_magic_link(
         ));
     };
 
+    // A mailbox that no longer belongs to the account must not complete a
+    // previously issued link. Email changes also delete these rows; this check
+    // closes links issued before that cleanup or by an older deployment.
+    if !magic_link.email.eq_ignore_ascii_case(&user.email) {
+        let _ = MagicLinksStore::delete(DB::Conn(&state.db), &query.token).await;
+        return Err(AppError::BadRequest(
+            "Invalid or expired magic link".to_string(),
+        ));
+    }
+
     let (org_slug_owned, service_slug_owned, redirect_uri_owned, callback_state_owned) =
         validate_magic_callback(&magic_link.context, &query)?;
     let org_slug = org_slug_owned.as_deref();
@@ -512,6 +523,9 @@ pub async fn verify_magic_link(
     let (resolved_org, resolved_service) =
         resolve_magic_service_context(&state.db, org_slug, service_slug, redirect_uri).await?;
     let resolved_org_id = resolved_org.as_ref().map(|org| org.id.as_str());
+    if resolved_org_id.is_none() {
+        crate::middleware::ensure_trusted_platform_origin(&headers, &state.config)?;
+    }
 
     reject_upstream_only_local_auth(
         &state,
@@ -558,6 +572,34 @@ pub async fn verify_magic_link(
     use crate::services::risk_engine::RiskAction;
     match risk_assessment.action {
         RiskAction::Allow | RiskAction::LogOnly => {
+            // Email possession is not a substitute for an enrolled second
+            // factor. If the user has MFA, complete the magic-link consume and
+            // return the same short-lived pre-auth challenge used by password
+            // and OAuth login.
+            if TotpStore::is_enabled(DB::Conn(&state.db), &user.id).await? {
+                let preauth_token = state.jwt_service.create_mfa_preauth_token(
+                    &user.id,
+                    &user.email,
+                    user.is_platform_owner,
+                    org_slug,
+                    service_slug,
+                    None,
+                )?;
+                consume_magic_link(&state, &query.token, &user, resolved_org_id, service_id)
+                    .await?;
+
+                return Ok((
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "requires_mfa": true,
+                        "preauth_token": preauth_token,
+                        "state": callback_state,
+                        "message": "Additional verification required"
+                    })),
+                )
+                    .into_response());
+            }
+
             // Generate JWT token with org context from magic link (Security Audit Item 4)
             let token = state.jwt_service.create_token(
                 &user.id,
@@ -736,11 +778,49 @@ pub fn hash_token(token: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::entities::identities;
+    use crate::audit::actor::AuditHandle;
+    use crate::billing::providers::disabled::DisabledBillingProvider;
+    use crate::crypto::sso::OAuthClient;
+    use crate::entities::{identities, prelude::UserTotpSecrets, user_totp_secrets};
+    use crate::services::{
+        events::EventDispatcher, metrics::MfaMetricsService, risk_engine::RiskEngine,
+    };
     use crate::store::users::{UserCreationOptions, UserStore};
+    use crate::test_support::{test_config, test_jwt_service};
+    use axum::body::to_bytes;
+    use axum::response::IntoResponse;
     use migration::{Migrator, MigratorTrait};
-    use sea_orm::{ActiveModelTrait, Database, Set};
+    use moka::future::Cache;
+    use sea_orm::{ActiveModelTrait, Database, EntityTrait, Set};
+    use std::sync::Arc;
     use uuid::Uuid;
+
+    async fn magic_state(db: &sea_orm::DatabaseConnection) -> AppState {
+        let config = test_config();
+        let jwt_service = Arc::new(test_jwt_service(&config));
+        AppState {
+            db: db.clone(),
+            #[cfg(feature = "db_sqlite")]
+            db_writer: db.clone(),
+            oauth_client: Arc::new(OAuthClient::new(&config).expect("oauth client")),
+            jwt_service,
+            base_url: config.base_url.clone(),
+            web_client_url: config.platform_dashboard_base_url.clone(),
+            full_web_client_url: config.full_web_client_base_url.clone(),
+            encryption: None,
+            email_service: None,
+            metrics_service: Arc::new(MfaMetricsService::new(db.clone())),
+            event_dispatcher: Arc::new(EventDispatcher::new(db.clone())),
+            billing_provider: Arc::new(DisabledBillingProvider::new()),
+            risk_engine: Arc::new(RiskEngine::new().expect("risk engine")),
+            webauthn_service: None,
+            permission_cache: Cache::new(10_000),
+            user_cache: Cache::new(10_000),
+            domain_cache: Cache::new(10_000),
+            audit_actor: AuditHandle::new(db.clone()),
+            config,
+        }
+    }
 
     async fn setup_magic_scope() -> (
         sea_orm::DatabaseConnection,
@@ -779,6 +859,56 @@ mod tests {
             .await
             .expect("create membership");
         (db, org, user)
+    }
+
+    #[tokio::test]
+    async fn magic_link_honors_enrolled_mfa() {
+        let (db, org, user) = setup_magic_scope().await;
+        UserTotpSecrets::insert(user_totp_secrets::ActiveModel {
+            id: Set("magic-mfa-totp".to_string()),
+            user_id: Set(user.id.clone()),
+            secret_encrypted: Set(vec![]),
+            encryption_key_id: Set("test-key".to_string()),
+            enabled: Set(true),
+            created_at: Set(Utc::now().naive_utc()),
+            enabled_at: Set(Some(Utc::now().naive_utc())),
+        })
+        .exec(&db)
+        .await
+        .expect("enroll MFA");
+
+        let context = build_magic_context(Some(&org.slug), None, None, None);
+        let token = MagicLinksStore::create(DB::Conn(&db), &user.email, Some(&user.id), &context)
+            .await
+            .expect("issue magic link");
+        let state = magic_state(&db).await;
+        let response = verify_magic_link(
+            State(state),
+            Extension(RequestInfo {
+                ip_address: "127.0.0.1".to_string(),
+                user_agent: "magic-mfa-test".to_string(),
+            }),
+            axum::http::HeaderMap::new(),
+            Query(VerifyMagicLinkQuery {
+                token: token.clone(),
+                redirect_uri: None,
+                state: None,
+            }),
+        )
+        .await
+        .expect("verify magic link")
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("JSON response");
+        assert_eq!(body["requires_mfa"], true);
+        assert!(body["preauth_token"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()));
+        assert!(MagicLinksStore::find_by_token(DB::Conn(&db), &token)
+            .await
+            .expect("reload magic link")
+            .is_none());
     }
 
     #[tokio::test]

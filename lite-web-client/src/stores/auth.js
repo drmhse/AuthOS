@@ -65,6 +65,12 @@ export const useAuthStore = defineStore('auth', {
       state.status === 'authenticated' && Boolean(state.token) && !isTokenExpired(state.token)
     ),
     isPlatformOwner: (state) => state.claims?.is_platform_owner === true,
+    isPlatformContext: (state) =>
+      Boolean(state.claims) &&
+      !state.claims.org &&
+      !state.claims.service &&
+      state.claims.aud === 'platform',
+    isMfaVerified: (state) => state.claims?.mfa_verified === true,
     currentOrgSlug: (state) => state.claims?.org || null,
     currentOrgId: (state) => state.claims?.org_id || null,
     userEmail: (state) => state.user?.email || state.claims?.email || null,

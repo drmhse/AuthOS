@@ -329,14 +329,16 @@ pub async fn verify_saml_mfa(
 pub async fn verify_mfa_login(
     State(state): State<AppState>,
     Extension(request_info): Extension<RequestInfo>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<MfaVerifyRequest>,
 ) -> Result<Json<RefreshTokenResponse>> {
-    if state
+    let preauth_claims = state
         .jwt_service
-        .validate_mfa_preauth_token(&req.preauth_token)?
-        .saml_state
-        .is_some()
-    {
+        .validate_mfa_preauth_token(&req.preauth_token)?;
+    if preauth_claims.is_platform_context() {
+        crate::middleware::ensure_trusted_platform_origin(&headers, &state.config)?;
+    }
+    if preauth_claims.saml_state.is_some() {
         return Err(AppError::BadRequest(
             "SAML MFA continuation must be submitted to /saml/mfa/verify".to_string(),
         ));
@@ -349,7 +351,7 @@ pub async fn verify_mfa_login(
     // Generate full session JWT
     let resource = crate::utils::resource_indicators::resource_from_audience(claims.aud.as_deref());
     let resource_owned = resource.map(str::to_string);
-    let token = state.jwt_service.create_token_with_resource(
+    let token = state.jwt_service.create_mfa_verified_token_with_resource(
         &user.id,
         &user.email,
         user.is_platform_owner,
@@ -593,6 +595,7 @@ mod tests {
             saml_state: None,
             device_code_id: device_code_id.map(str::to_string),
             act: None,
+            bootstrap: None,
             aud: Some("platform".to_string()),
             iss: Some("https://auth.example.com".to_string()),
             scope: None,

@@ -72,6 +72,7 @@ checked against the authenticated principal.
 | Service-scoped `sessions` | `service_id -> services.org_id`, optional `org_slug` | Access-token hash, refresh-token hash and consumed-hash history, resource, device metadata | User ownership/admin revocation through proven service/org; deny arbitrary session ID and other-service revocation. |
 | `login_events` | `service_id -> services.org_id` and/or `org_id` | Identity, provider, IP, user agent, outcome | Tenant analytics/audit scope; platform aggregation explicit; deny cross-org filters and raw event IDs. |
 | Service API user operations | Authenticated `ServicePrincipal.service_id` | User accounts and subscriptions managed by service | Ignore client tenant selectors; filter every lookup/mutation by principal service; enforce each API-key permission independently. |
+| Service-login JWTs | Relying-party service session | Full management token if unrestricted | Accept only `GET /api/user` and `GET /api/subscription`; deny organization, privacy, account-security, MFA, device, and platform routes. |
 
 ## User-owned and context-dependent resources
 
@@ -102,7 +103,7 @@ checked against the authenticated principal.
 
 | Resource/entity | Intended scope | Required controls and tests |
 | --- | --- | --- |
-| Platform-owner user flag and platform routes | Platform | Check current database user, not client claims alone; test demotion/cache staleness, MFA policy, bootstrap closure, and tenant-admin denial. |
+| Platform-owner user flag and platform routes | Platform | Require a platform-context token, current non-deleted database user, enrolled MFA, and an MFA-completion marker from the current login; test demotion/cache staleness, tenant/service-token denial, passkey-only and refreshed-session denial, promotion session revocation, bootstrap closure, and tenant-admin denial. |
 | `platform_audit_log` | Platform | Platform-owner read access only; redact secrets/PII; test actor/impersonation attribution and cross-role denial. |
 | `organization_tiers` and `plans`/feature governance | Platform definitions with tenant assignments | Platform-owner mutations; tenant reads only where intended; deny tenant write and arbitrary tier escalation. |
 | `mfa_daily_metrics` | Optional organization or platform aggregate | Explicit org filter for tenant views; platform-only global rows; test null-org handling. |

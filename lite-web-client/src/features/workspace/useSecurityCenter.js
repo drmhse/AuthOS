@@ -1,7 +1,9 @@
 import { computed, ref, watch } from 'vue';
 import { sso } from '@/lib/api';
+import { useAuthStore } from '@/stores/auth';
 
 export function useSecurityCenter(refreshVersion) {
+  const authStore = useAuthStore();
   const message = ref('');
   const messageType = ref('success');
   const mfaStatus = ref(null);
@@ -27,13 +29,24 @@ export function useSecurityCenter(refreshVersion) {
     mfaStatus.value = await sso.user.mfa.getStatus();
   }
 
-  async function startMfaSetup() {
+  function startMfaSetup() {
     message.value = '';
-    try {
-      mfaSetup.value = await sso.user.mfa.setup();
-    } catch (error) {
-      setError(error.message || 'Failed to start MFA setup.');
-    }
+    mfaSetup.value = null;
+    backupCodes.value = [];
+    dialog.value = {
+      open: true,
+      kind: 'enable-mfa',
+      title: 'Enable multi-factor authentication',
+      description:
+        'Confirm your current password if the account has one. OAuth-only accounts may leave it blank.',
+      confirmLabel: 'Continue',
+      destructive: false,
+      inputLabel: 'Current password (if set)',
+      inputType: 'password',
+      requireInput: false,
+      inputValue: '',
+      payload: null,
+    };
   }
 
   async function completeMfaSetup() {
@@ -42,7 +55,10 @@ export function useSecurityCenter(refreshVersion) {
       mfaSetup.value = null;
       mfaCode.value = '';
       backupCodes.value = response.backup_codes || [];
-      setSuccess('MFA enabled.');
+      if (response.access_token && response.refresh_token) {
+        await authStore.handleLoginCallback(response.access_token, response.refresh_token);
+      }
+      setSuccess('MFA enabled. Save the backup codes below.');
       await loadMfaStatus();
     } catch (error) {
       setError(error.message || 'Failed to finish MFA setup.');
@@ -63,10 +79,13 @@ export function useSecurityCenter(refreshVersion) {
       open: true,
       kind: 'disable-mfa',
       title: 'Disable MFA?',
-      description: 'This removes the extra authentication factor from the current account.',
+      description:
+        'Enter a current authenticator or backup code. This removes the extra authentication factor from the account.',
       confirmLabel: 'Disable MFA',
       destructive: true,
-      inputLabel: '',
+      inputLabel: 'Authenticator or backup code',
+      inputType: 'text',
+      requireInput: true,
       inputValue: '',
       payload: null,
     };
@@ -77,10 +96,13 @@ export function useSecurityCenter(refreshVersion) {
       open: true,
       kind: 'regenerate-backups',
       title: 'Regenerate backup codes?',
-      description: 'Generating a new set invalidates the current recovery codes immediately.',
+      description:
+        'Enter a current authenticator or backup code. Generating a new set invalidates the current recovery codes immediately.',
       confirmLabel: 'Generate codes',
       destructive: true,
-      inputLabel: '',
+      inputLabel: 'Authenticator or backup code',
+      inputType: 'text',
+      requireInput: true,
       inputValue: '',
       payload: null,
     };
@@ -162,14 +184,28 @@ export function useSecurityCenter(refreshVersion) {
 
     try {
       switch (dialog.value.kind) {
-        case 'disable-mfa':
-          await sso.user.mfa.disable();
+        case 'enable-mfa': {
+          mfaSetup.value = await sso.user.mfa.setup({
+            current_password: dialog.value.inputValue.trim() || undefined,
+          });
+          break;
+        }
+        case 'disable-mfa': {
+          const response = await sso.user.mfa.disable({
+            mfa_code: dialog.value.inputValue.trim(),
+          });
+          if (response.access_token && response.refresh_token) {
+            await authStore.handleLoginCallback(response.access_token, response.refresh_token);
+          }
           backupCodes.value = [];
           setSuccess('MFA disabled.');
           await loadMfaStatus();
           break;
+        }
         case 'regenerate-backups': {
-          const response = await sso.user.mfa.regenerateBackupCodes();
+          const response = await sso.user.mfa.regenerateBackupCodes({
+            mfa_code: dialog.value.inputValue.trim(),
+          });
           backupCodes.value = response.backup_codes || [];
           setSuccess('Backup codes regenerated.');
           break;

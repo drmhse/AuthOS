@@ -116,6 +116,12 @@ pub async fn start_link(
     let auth_user = auth_user
         .ok_or_else(|| AppError::Unauthorized("Not authenticated".to_string()))?
         .0;
+    crate::middleware::require_recent_authentication(
+        &state.db,
+        &auth_user,
+        chrono::Duration::minutes(10),
+    )
+    .await?;
 
     let provider = Provider::from_str(&provider_str)?;
 
@@ -458,7 +464,7 @@ mod tests {
         events::EventDispatcher, metrics::MfaMetricsService, risk_engine::RiskEngine,
     };
     use crate::state::AppState;
-    use crate::store::{identities::IdentityStore, users::UserStore};
+    use crate::store::{identities::IdentityStore, sessions::SessionStore, users::UserStore};
     use base64::{engine::general_purpose::STANDARD, Engine};
     use migration::{Migrator, MigratorTrait};
     use moka::future::Cache;
@@ -517,19 +523,32 @@ mod tests {
             config,
         };
 
+        let token = jwt_service
+            .create_token(&user.id, &user.email, false, None, None)
+            .expect("create token");
+        let session = SessionStore::create(
+            DB::Conn(&db),
+            &user.id,
+            &JwtService::hash_token(&token),
+            (chrono::Utc::now() + chrono::Duration::hours(1)).naive_utc(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("identity-test"),
+            Some("127.0.0.1"),
+        )
+        .await
+        .expect("create session");
         let auth_user = AuthUser {
             // Claims are unused by these handlers beyond org/service context.
-            claims: {
-                let token = jwt_service
-                    .create_token(&user.id, &user.email, false, None, None)
-                    .expect("create token");
-                jwt_service.validate_token(&token).expect("validate token")
-            },
+            claims: jwt_service.validate_token(&token).expect("validate token"),
             user,
             permissions: vec![],
             ip_address: "127.0.0.1".to_string(),
             user_agent: "identity-test".to_string(),
-            current_session_id: None,
+            current_session_id: Some(session.id),
         };
         Fixture { state, auth_user }
     }

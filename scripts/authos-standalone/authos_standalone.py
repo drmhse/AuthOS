@@ -589,25 +589,33 @@ def provision_resources(config: dict, state: dict, paths: dict, bootstrap_token:
     client = StandaloneAuthOsClient(base_url, token)
     report = []
 
-    for service in services:
+    try:
+        for service in services:
+            try:
+                organization_status = ensure_organization(client, service["org"], service.get("orgName") or service["org"])
+                service_result = ensure_service(client, service)
+                api_keys = []
+                for api_key in service.get("apiKeys") or []:
+                    api_keys.append(ensure_api_key(client, paths, service, api_key))
+                report.append({
+                    "org": service["org"],
+                    "organizationStatus": organization_status,
+                    "service": service["service"],
+                    "serviceStatus": service_result["status"],
+                    "clientId": service_result["clientId"],
+                    "apiKeys": api_keys,
+                })
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Provisioning failed for services entry '{service.get('org', '?')}/{service.get('service', '?')}': {exc}"
+                ) from exc
+    finally:
+        # Do not leave the bootstrap provisioning session behind after the
+        # installer has finished using it.
         try:
-            organization_status = ensure_organization(client, service["org"], service.get("orgName") or service["org"])
-            service_result = ensure_service(client, service)
-            api_keys = []
-            for api_key in service.get("apiKeys") or []:
-                api_keys.append(ensure_api_key(client, paths, service, api_key))
-            report.append({
-                "org": service["org"],
-                "organizationStatus": organization_status,
-                "service": service["service"],
-                "serviceStatus": service_result["status"],
-                "clientId": service_result["clientId"],
-                "apiKeys": api_keys,
-            })
-        except Exception as exc:
-            raise RuntimeError(
-                f"Provisioning failed for services entry '{service.get('org', '?')}/{service.get('service', '?')}': {exc}"
-            ) from exc
+            client.request("/api/auth/logout", method="POST")
+        except Exception:
+            pass
 
     return report
 

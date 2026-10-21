@@ -47,19 +47,13 @@ pub struct OrganizationResponse {
 async fn require_capability(
     state: &AppState,
     org_id: &str,
-    user: &crate::entities::users::Model,
+    auth_user: &AuthUser,
     capability: &str,
     message: &str,
 ) -> Result<()> {
-    let has_live_platform_authority = if user.is_platform_owner {
-        crate::store::users::UserStore::find_by_id(DB::Conn(&state.db), &user.id)
+    if crate::middleware::has_live_platform_authority(&state.db, auth_user).await?
+        || PermissionService::check(DB::Conn(&state.db), org_id, &auth_user.user.id, capability)
             .await?
-            .is_some_and(|current| current.is_platform_owner && current.deleted_at.is_none())
-    } else {
-        false
-    };
-    if has_live_platform_authority
-        || PermissionService::check(DB::Conn(&state.db), org_id, &user.id, capability).await?
     {
         return Ok(());
     }
@@ -70,24 +64,36 @@ async fn require_capability(
 async fn require_any_capability(
     state: &AppState,
     org_id: &str,
-    user: &crate::entities::users::Model,
+    auth_user: &AuthUser,
     capabilities: &[&str],
     message: &str,
 ) -> Result<()> {
-    let has_live_platform_authority = if user.is_platform_owner {
-        crate::store::users::UserStore::find_by_id(DB::Conn(&state.db), &user.id)
-            .await?
-            .is_some_and(|current| current.is_platform_owner && current.deleted_at.is_none())
-    } else {
-        false
-    };
-    if has_live_platform_authority
-        || PermissionService::check_any(DB::Conn(&state.db), org_id, &user.id, capabilities).await?
+    if crate::middleware::has_live_platform_authority(&state.db, auth_user).await?
+        || PermissionService::check_any(
+            DB::Conn(&state.db),
+            org_id,
+            &auth_user.user.id,
+            capabilities,
+        )
+        .await?
     {
         return Ok(());
     }
 
     Err(AppError::Forbidden(message.to_string()))
+}
+
+async fn current_session_created_at(
+    state: &AppState,
+    auth_user: &AuthUser,
+) -> Result<chrono::NaiveDateTime> {
+    let Some(session_id) = auth_user.current_session_id.as_deref() else {
+        return Ok(Utc::now().naive_utc());
+    };
+    let session = crate::store::sessions::SessionStore::find_by_id(DB::Conn(&state.db), session_id)
+        .await?
+        .ok_or_else(|| AppError::Unauthorized("Session is no longer active".to_string()))?;
+    Ok(session.created_at)
 }
 
 #[derive(Debug, Serialize)]
@@ -243,8 +249,11 @@ pub async fn create_organization(
         .map_err(|e| AppError::InternalServerError(format!("Failed to create JWT: {}", e)))?;
 
     let refresh_token = crate::crypto::refresh_tokens::generate();
+    let session_created_at = current_session_created_at(&state, &auth_user).await?;
 
-    // Store session with refresh token
+    // Store session with refresh token. The new organization context is a
+    // session switch, not a fresh authentication; preserve the original auth
+    // time for recent-auth step-up checks.
     let token_hash = JwtService::hash_token(&access_token);
     let now = Utc::now();
     let expires_at = now + chrono::Duration::hours(state.config.jwt_expiration_hours);
@@ -261,7 +270,7 @@ pub async fn create_organization(
             let refresh_token = refresh_token.clone();
             let org_slug = organization.slug.clone();
             Box::pin(async move {
-                SessionStore::create(
+                SessionStore::create_with_created_at(
                     db.clone(),
                     &user_id,
                     &token_hash,
@@ -273,6 +282,7 @@ pub async fn create_organization(
                     None, // resource
                     None, // user_agent
                     None, // ip_address
+                    session_created_at,
                 )
                 .await
             })
@@ -322,8 +332,6 @@ pub async fn update_organization(
     Path(org_slug): Path<String>,
     Json(req): Json<UpdateOrganizationRequest>,
 ) -> Result<Json<OrganizationResponse>> {
-    let user = &auth_user.user;
-
     let organization = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
         .await?
         .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
@@ -331,7 +339,7 @@ pub async fn update_organization(
     require_capability(
         &state,
         &organization.id,
-        user,
+        &auth_user,
         CAP_ORG_SETTINGS_MANAGE,
         "Insufficient permissions to manage organization settings",
     )
@@ -546,7 +554,10 @@ pub async fn select_organization(
 
     let refresh_token = crate::crypto::refresh_tokens::generate();
 
-    // Store session with refresh token
+    let session_created_at = current_session_created_at(&state, &auth_user).await?;
+
+    // Store session with refresh token. Switching organization is not a fresh
+    // authentication; preserve the original auth time.
     let token_hash = JwtService::hash_token(&access_token);
     let now = Utc::now();
     let expires_at = now + chrono::Duration::hours(state.config.jwt_expiration_hours);
@@ -569,7 +580,7 @@ pub async fn select_organization(
             let refresh_token = refresh_token_clone.clone();
             let org_slug = org_slug_clone.clone();
             Box::pin(async move {
-                SessionStore::create(
+                SessionStore::create_with_created_at(
                     db.clone(),
                     &user_id,
                     &token_hash,
@@ -581,6 +592,7 @@ pub async fn select_organization(
                     None, // resource
                     None, // user_agent
                     None, // ip_address
+                    session_created_at,
                 )
                 .await
             })
@@ -672,7 +684,10 @@ mod tests {
     use crate::services::{
         events::EventDispatcher, metrics::MfaMetricsService, risk_engine::RiskEngine,
     };
-    use crate::store::users::{UserCreationOptions, UserStore};
+    use crate::store::{
+        sessions::SessionStore,
+        users::{UserCreationOptions, UserStore},
+    };
 
     use migration::{Migrator, MigratorTrait};
     use moka::future::Cache;
@@ -787,7 +802,7 @@ mod tests {
             .jwt_service
             .validate_token(&current_token)
             .expect("validate initial org token");
-        let auth_user = AuthUser {
+        let mut auth_user = AuthUser {
             claims,
             user,
             permissions: vec![],
@@ -795,6 +810,24 @@ mod tests {
             user_agent: "org-switch-test".to_string(),
             current_session_id: None,
         };
+        let original_auth_time = Utc::now().naive_utc() - chrono::Duration::minutes(30);
+        let original_session = SessionStore::create_with_created_at(
+            DB::Conn(&db),
+            &auth_user.user.id,
+            &JwtService::hash_token(&current_token),
+            (Utc::now() + chrono::Duration::hours(1)).naive_utc(),
+            None,
+            None,
+            Some(&alpha.slug),
+            None,
+            None,
+            Some("org-switch-test"),
+            Some("127.0.0.1"),
+            original_auth_time,
+        )
+        .await
+        .expect("create original session");
+        auth_user.current_session_id = Some(original_session.id.clone());
 
         OrgSwitchFixture {
             state,
@@ -840,6 +873,21 @@ mod tests {
             Some(fixture.beta_slug.as_str())
         );
         assert_eq!(session.service_id, None);
+        let original = SessionStore::find_by_id(
+            DB::Conn(&fixture.state.db),
+            fixture
+                .auth_user
+                .current_session_id
+                .as_deref()
+                .expect("original session id"),
+        )
+        .await
+        .expect("load original session")
+        .expect("original session exists");
+        assert_eq!(
+            session.created_at, original.created_at,
+            "organization switching must preserve the original authentication time"
+        );
     }
 
     #[tokio::test]
@@ -895,11 +943,14 @@ mod tests {
         let mut stale_user = fixture.auth_user.user.clone();
         stale_user.is_platform_owner = true;
 
+        let mut stale_auth_user = fixture.auth_user.clone();
+        stale_auth_user.user = stale_user;
+
         assert!(matches!(
             require_capability(
                 &fixture.state,
                 &gamma.id,
-                &stale_user,
+                &stale_auth_user,
                 CAP_RISK_POLICIES_MANAGE,
                 "denied",
             )
@@ -952,7 +1003,7 @@ pub async fn get_risk_settings(
     require_any_capability(
         &state,
         &org.id,
-        &_auth_user.user,
+        &_auth_user,
         &[CAP_RISK_EVENTS_VIEW, CAP_RISK_POLICIES_MANAGE],
         "Insufficient permissions to view risk settings",
     )
@@ -988,7 +1039,7 @@ pub async fn update_risk_settings(
     require_capability(
         &state,
         &org.id,
-        &_auth_user.user,
+        &_auth_user,
         CAP_RISK_POLICIES_MANAGE,
         "Insufficient permissions to manage risk settings",
     )
@@ -1109,7 +1160,7 @@ pub async fn reset_risk_settings(
     require_capability(
         &state,
         &org.id,
-        &_auth_user.user,
+        &_auth_user,
         CAP_RISK_POLICIES_MANAGE,
         "Insufficient permissions to manage risk settings",
     )

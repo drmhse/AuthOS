@@ -59,6 +59,15 @@ pub struct AuthUser {
     pub current_session_id: Option<String>,
 }
 
+impl AuthUser {
+    /// Platform authority requires a token minted for the platform context.
+    /// Tenant and service login tokens never carry this authority, even when
+    /// the user row currently has the platform-owner flag.
+    pub fn has_platform_token_context(&self) -> bool {
+        self.claims.is_platform_context()
+    }
+}
+
 /// Marks a request as already impersonating; handlers read only its presence,
 /// to refuse nesting a second impersonation inside the first.
 #[derive(Clone, Debug)]
@@ -128,12 +137,24 @@ async fn fetch_and_cache_user(
     use crate::store::users::UserStore;
 
     if let Some(cached_user) = cache.get(user_id).await {
+        if cached_user.deleted_at.is_some() {
+            cache.invalidate(user_id).await;
+            return Err(AppError::Unauthorized(
+                "User is no longer active".to_string(),
+            ));
+        }
         return Ok(cached_user);
     }
 
     let user = UserStore::find_by_id(DB::Conn(db), user_id)
         .await?
         .ok_or_else(|| AppError::Unauthorized("User not found".to_string()))?;
+    if user.deleted_at.is_some() {
+        cache.invalidate(user_id).await;
+        return Err(AppError::Unauthorized(
+            "User is no longer active".to_string(),
+        ));
+    }
 
     cache.insert(user_id.to_string(), user.clone()).await;
 
@@ -163,6 +184,11 @@ async fn validate_current_impersonation_authority(
         ));
     }
     if actor_user.is_platform_owner {
+        if !crate::store::totp::TotpStore::is_enabled(DB::Conn(db), &actor_user.id).await? {
+            return Err(AppError::Unauthorized(
+                "Impersonation authorization is no longer valid".to_string(),
+            ));
+        }
         return Ok(());
     }
     if target.is_platform_owner {
@@ -357,6 +383,13 @@ pub async fn require_platform_owner(
         .get::<AuthUser>()
         .ok_or((StatusCode::UNAUTHORIZED, "Not authenticated".to_string()))?;
 
+    if !auth_user.has_platform_token_context() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "A platform-context token is required for this operation".to_string(),
+        ));
+    }
+
     if !has_current_platform_authority(&state.db, &auth_user.user.id)
         .await
         .map_err(|_| {
@@ -372,6 +405,39 @@ pub async fn require_platform_owner(
         ));
     }
 
+    // The one-time bootstrap session may perform initial provisioning before
+    // the first owner has enrolled MFA. Enabling MFA revokes this session.
+    let bootstrap_provisioning = auth_user.claims.bootstrap == Some(true);
+    if !bootstrap_provisioning {
+        if !crate::store::totp::TotpStore::is_enabled(
+            crate::db::DB::Conn(&state.db),
+            &auth_user.user.id,
+        )
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Unable to verify platform MFA enrollment".to_string(),
+            )
+        })? {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "Platform owner MFA enrollment is required before accessing platform controls"
+                    .to_string(),
+            ));
+        }
+        // Enrollment alone is not enough: a passkey-only login can occur
+        // without the TOTP step. Platform authority is granted only to a token
+        // minted by the MFA completion flow (or the narrow bootstrap session).
+        if auth_user.claims.mfa_verified != Some(true) {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "Multi-factor verification is required before accessing platform controls"
+                    .to_string(),
+            ));
+        }
+    }
+
     Ok(next.run(req).await)
 }
 
@@ -382,6 +448,215 @@ async fn has_current_platform_authority(db: &DatabaseConnection, user_id: &str) 
     Ok(UserStore::find_by_id(DB::Conn(db), user_id)
         .await?
         .is_some_and(|user| user.is_platform_owner && user.deleted_at.is_none()))
+}
+
+/// Live platform authority for a specific request. This is stricter than the
+/// database role check: the token must be platform-scoped, carry proof that the
+/// current login completed the MFA challenge (or be the narrow bootstrap
+/// session), and belong to a non-deleted platform owner with MFA enrolled.
+pub async fn has_live_platform_authority(
+    db: &DatabaseConnection,
+    auth_user: &AuthUser,
+) -> Result<bool> {
+    has_live_platform_authority_in(
+        crate::db::DB::Conn(db),
+        &auth_user.user.id,
+        auth_user.has_platform_token_context(),
+        auth_user.claims.mfa_verified == Some(true) || auth_user.claims.bootstrap == Some(true),
+    )
+    .await
+}
+
+/// Transaction-friendly live platform authority check. The token-context and
+/// MFA-completion hints come from the authenticated request; the role and MFA
+/// enrollment state are always re-read from the database so demotion and factor
+/// removal are immediate.
+pub async fn has_live_platform_authority_in(
+    db: crate::db::DB<'_>,
+    user_id: &str,
+    platform_token_context: bool,
+    platform_mfa_verified: bool,
+) -> Result<bool> {
+    if !platform_token_context || !platform_mfa_verified {
+        return Ok(false);
+    }
+    let Some(user) = crate::store::users::UserStore::find_by_id(db.clone(), user_id).await? else {
+        return Ok(false);
+    };
+    if !user.is_platform_owner || user.deleted_at.is_some() {
+        return Ok(false);
+    }
+    crate::store::totp::TotpStore::is_enabled(db, user_id).await
+}
+
+/// Service-login tokens are delivered to the relying party. They may read the
+/// authenticated user's profile and subscription, but must not be accepted as
+/// organization or platform management credentials.
+pub async fn enforce_service_token_scope(
+    req: Request,
+    next: Next,
+) -> std::result::Result<Response, AppError> {
+    let Some(auth_user) = req.extensions().get::<AuthUser>() else {
+        return Err(AppError::Unauthorized("Not authenticated".to_string()));
+    };
+
+    if !auth_user.claims.is_service_context() {
+        return Ok(next.run(req).await);
+    }
+
+    if !service_token_path_allowed(req.method(), req.uri().path()) {
+        return Err(AppError::Forbidden(
+            "Service-scoped tokens may only read the authenticated user's profile and subscription"
+                .to_string(),
+        ));
+    }
+
+    Ok(next.run(req).await)
+}
+
+/// Platform-context login material must not be handed to a tenant-controlled
+/// browser origin. Non-browser clients do not send Origin and remain usable.
+pub fn ensure_trusted_platform_origin(
+    headers: &axum::http::HeaderMap,
+    config: &crate::config::Config,
+) -> Result<()> {
+    let Some(origin) = headers
+        .get(axum::http::header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(());
+    };
+
+    let Some(origin) = url::Url::parse(origin)
+        .ok()
+        .map(|url| url.origin().ascii_serialization())
+    else {
+        return Err(AppError::Forbidden(
+            "Platform sign-in is only available from the configured platform origin".to_string(),
+        ));
+    };
+    let allowed = [
+        Some(config.platform_dashboard_base_url.as_str()),
+        Some(config.base_url.as_str()),
+        config.full_web_client_base_url.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|candidate| url::Url::parse(candidate).ok())
+    .any(|candidate| candidate.origin().ascii_serialization() == origin);
+
+    if allowed {
+        Ok(())
+    } else {
+        Err(AppError::Forbidden(
+            "Platform sign-in is only available from the configured platform origin".to_string(),
+        ))
+    }
+}
+
+fn service_token_path_allowed(method: &axum::http::Method, path: &str) -> bool {
+    method == axum::http::Method::GET && (path == "/api/user" || path == "/api/subscription")
+}
+
+/// Impersonation is for scoped support actions, not for establishing a
+/// persistent login as the target. Factor, identity, device, recovery, and
+/// self-deletion changes are therefore refused inside an impersonation session.
+pub async fn reject_impersonation_for_sensitive_actions(
+    req: Request,
+    next: Next,
+) -> std::result::Result<Response, AppError> {
+    if req.extensions().get::<ImpersonationContext>().is_some()
+        && is_sensitive_impersonation_action(req.method(), req.uri().path())
+    {
+        return Err(AppError::Forbidden(
+            "Account security and identity-linking changes are not allowed while impersonating a user"
+                .to_string(),
+        ));
+    }
+    Ok(next.run(req).await)
+}
+
+fn is_sensitive_impersonation_action(method: &axum::http::Method, path: &str) -> bool {
+    let post = *method == axum::http::Method::POST;
+    let patch = *method == axum::http::Method::PATCH;
+    let delete = *method == axum::http::Method::DELETE;
+
+    if patch && path == "/api/user" {
+        return true;
+    }
+    if post
+        && matches!(
+            path,
+            "/api/user/change-password"
+                | "/api/user/set-password"
+                | "/api/user/mfa/setup"
+                | "/api/user/mfa/verify"
+                | "/api/user/mfa/backup-codes/regenerate"
+                | "/api/user/devices/revoke-all"
+        )
+    {
+        return true;
+    }
+    if delete && path == "/api/user/mfa" {
+        return true;
+    }
+    if post && path.starts_with("/api/auth/passkeys/register/") {
+        return true;
+    }
+    if (patch || delete) && path.starts_with("/api/auth/passkeys/") {
+        return true;
+    }
+    if (post || delete) && path.starts_with("/api/user/identities") {
+        return true;
+    }
+    if (post || delete) && path.starts_with("/api/user/linked-accounts") {
+        return true;
+    }
+    if post && path.starts_with("/api/user/provider-token-requests/") {
+        return true;
+    }
+    if (post || patch || delete) && path.starts_with("/api/user/devices") {
+        return true;
+    }
+    if delete && path.starts_with("/api/privacy/forget/") {
+        return true;
+    }
+    false
+}
+
+/// Require that the current browser session was established recently. This is
+/// used as a step-up boundary for security-sensitive account changes. Refresh
+/// operations preserve the original session creation time.
+pub async fn require_recent_authentication(
+    db: &DatabaseConnection,
+    auth_user: &AuthUser,
+    max_age: chrono::Duration,
+) -> Result<()> {
+    use crate::db::DB;
+    use crate::store::sessions::SessionStore;
+
+    let session_id = auth_user.current_session_id.as_deref().ok_or_else(|| {
+        AppError::Forbidden(
+            "Reauthentication is required before changing account security settings".to_string(),
+        )
+    })?;
+    let session = SessionStore::find_by_id(DB::Conn(db), session_id)
+        .await?
+        .ok_or_else(|| {
+            AppError::Forbidden(
+                "Reauthentication is required before changing account security settings"
+                    .to_string(),
+            )
+        })?;
+    let age = chrono::Utc::now().naive_utc() - session.created_at;
+    if age > max_age {
+        return Err(AppError::Forbidden(
+            "Reauthentication is required before changing account security settings".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Helper function to check if user has required role in organization
@@ -519,6 +794,63 @@ impl EmailRateLimiter {
     }
 }
 
+/// In-memory failed-login throttling keyed by normalized email. This is a
+/// defense-in-depth layer on top of the route IP limiter and Argon2 cost. It is
+/// intentionally process-local; deployments with multiple replicas should also
+/// apply an edge rate limit.
+#[derive(Clone)]
+pub struct LoginAttemptLimiter {
+    attempts: Arc<RwLock<HashMap<String, Vec<Instant>>>>,
+    max_attempts: usize,
+    window: Duration,
+}
+
+impl LoginAttemptLimiter {
+    pub fn new(max_attempts: usize, window: Duration) -> Self {
+        Self {
+            attempts: Arc::new(RwLock::new(HashMap::new())),
+            max_attempts,
+            window,
+        }
+    }
+
+    fn normalize(email: &str) -> String {
+        email.trim().to_lowercase()
+    }
+
+    pub async fn is_rate_limited(&self, email: &str) -> bool {
+        let key = Self::normalize(email);
+        let mut attempts = self.attempts.write().await;
+        let now = Instant::now();
+        let entry = attempts.entry(key).or_insert_with(Vec::new);
+        entry.retain(|&timestamp| now.duration_since(timestamp) < self.window);
+        entry.len() >= self.max_attempts
+    }
+
+    pub async fn record_failure(&self, email: &str) {
+        let key = Self::normalize(email);
+        let mut attempts = self.attempts.write().await;
+        let now = Instant::now();
+        let entry = attempts.entry(key).or_insert_with(Vec::new);
+        entry.retain(|&timestamp| now.duration_since(timestamp) < self.window);
+        entry.push(now);
+    }
+
+    pub async fn clear(&self, email: &str) {
+        let key = Self::normalize(email);
+        self.attempts.write().await.remove(&key);
+    }
+
+    pub async fn cleanup(&self) {
+        let now = Instant::now();
+        let mut attempts = self.attempts.write().await;
+        attempts.retain(|_, timestamps| {
+            timestamps.retain(|&timestamp| now.duration_since(timestamp) < self.window);
+            !timestamps.is_empty()
+        });
+    }
+}
+
 // MFA Rate Limiting Middleware
 
 /// In-memory rate limiter for MFA verification attempts
@@ -631,6 +963,9 @@ pub static EMAIL_RATE_LIMITER: std::sync::LazyLock<EmailRateLimiter> =
     std::sync::LazyLock::new(|| {
         EmailRateLimiter::new(5) // Max 5 emails per hour per email address
     });
+
+pub static LOGIN_ATTEMPT_LIMITER: std::sync::LazyLock<LoginAttemptLimiter> =
+    std::sync::LazyLock::new(|| LoginAttemptLimiter::new(10, Duration::from_secs(15 * 60)));
 
 pub static MFA_RATE_LIMITER: std::sync::LazyLock<MfaRateLimiter> = std::sync::LazyLock::new(|| {
     MfaRateLimiter::new(
@@ -1114,15 +1449,129 @@ pub async fn scim_auth_middleware(
 }
 
 #[cfg(test)]
+mod service_token_scope_tests {
+    use super::*;
+
+    #[test]
+    fn service_tokens_can_only_read_profile_and_subscription() {
+        assert!(service_token_path_allowed(
+            &axum::http::Method::GET,
+            "/api/user"
+        ));
+        assert!(service_token_path_allowed(
+            &axum::http::Method::GET,
+            "/api/subscription"
+        ));
+        for (method, path) in [
+            (axum::http::Method::GET, "/api/organizations"),
+            (axum::http::Method::GET, "/api/platform/users"),
+            (axum::http::Method::PATCH, "/api/user"),
+            (axum::http::Method::POST, "/api/user/mfa/setup"),
+            (axum::http::Method::DELETE, "/api/user/mfa"),
+            (axum::http::Method::GET, "/api/privacy/export/user"),
+        ] {
+            assert!(
+                !service_token_path_allowed(&method, path),
+                "{method} {path} must be denied"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod impersonation_sensitive_action_tests {
+    use super::*;
+
+    #[test]
+    fn impersonation_cannot_change_factors_identity_devices_or_delete_account() {
+        for (method, path) in [
+            (axum::http::Method::PATCH, "/api/user"),
+            (axum::http::Method::POST, "/api/user/change-password"),
+            (axum::http::Method::POST, "/api/user/mfa/setup"),
+            (axum::http::Method::DELETE, "/api/user/mfa"),
+            (axum::http::Method::POST, "/api/user/identities/github/link"),
+            (axum::http::Method::DELETE, "/api/user/identities/github"),
+            (
+                axum::http::Method::POST,
+                "/api/user/linked-accounts/github/link",
+            ),
+            (
+                axum::http::Method::POST,
+                "/api/user/provider-token-requests/state/complete",
+            ),
+            (
+                axum::http::Method::POST,
+                "/api/auth/passkeys/register/start",
+            ),
+            (axum::http::Method::PATCH, "/api/auth/passkeys/passkey-1"),
+            (axum::http::Method::POST, "/api/user/devices/device-1/trust"),
+            (axum::http::Method::DELETE, "/api/privacy/forget/user-1"),
+        ] {
+            assert!(
+                is_sensitive_impersonation_action(&method, path),
+                "{method} {path} must be denied during impersonation"
+            );
+        }
+
+        for (method, path) in [
+            (axum::http::Method::GET, "/api/user"),
+            (axum::http::Method::GET, "/api/user/identities"),
+            (axum::http::Method::GET, "/api/organizations/acme/services"),
+            (axum::http::Method::GET, "/api/privacy/export/user-1"),
+            (
+                axum::http::Method::POST,
+                "/api/organizations/acme/invitations",
+            ),
+        ] {
+            assert!(
+                !is_sensitive_impersonation_action(&method, path),
+                "{method} {path} should remain available to support impersonation"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod platform_origin_tests {
+    use super::*;
+    use axum::http::{HeaderMap, HeaderValue};
+
+    #[test]
+    fn platform_origin_guard_allows_configured_origins_and_non_browser_clients() {
+        let config = crate::test_support::test_config();
+        assert!(ensure_trusted_platform_origin(&HeaderMap::new(), &config).is_ok());
+
+        for origin in [
+            config.platform_dashboard_base_url.as_str(),
+            config.base_url.as_str(),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                axum::http::header::ORIGIN,
+                HeaderValue::from_str(origin).expect("origin"),
+            );
+            assert!(ensure_trusted_platform_origin(&headers, &config).is_ok());
+        }
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::ORIGIN,
+            HeaderValue::from_static("https://tenant.example.test"),
+        );
+        assert!(ensure_trusted_platform_origin(&headers, &config).is_err());
+    }
+}
+
+#[cfg(test)]
 mod impersonation_authority_tests {
     use super::*;
     use crate::db::DB;
-    use crate::entities::users;
+    use crate::entities::{prelude::UserTotpSecrets, user_totp_secrets, users};
     use crate::store::{
         memberships::MembershipStore, organizations::OrganizationStore, users::UserStore,
     };
     use migration::{Migrator, MigratorTrait};
-    use sea_orm::{ActiveModelTrait, Database, Set};
+    use sea_orm::{ActiveModelTrait, Database, EntityTrait, Set};
 
     #[tokio::test]
     async fn org_impersonation_authority_tracks_role_target_scope_and_org_status() {
@@ -1214,6 +1663,18 @@ mod impersonation_authority_tests {
         let actor_user = UserStore::create(DB::Conn(&db), "owner@example.com", None, true)
             .await
             .expect("create actor");
+        UserTotpSecrets::insert(user_totp_secrets::ActiveModel {
+            id: Set("impersonation-actor-totp".to_string()),
+            user_id: Set(actor_user.id.clone()),
+            secret_encrypted: Set(vec![]),
+            encryption_key_id: Set("test-key".to_string()),
+            enabled: Set(true),
+            created_at: Set(chrono::Utc::now().naive_utc()),
+            enabled_at: Set(Some(chrono::Utc::now().naive_utc())),
+        })
+        .exec(&db)
+        .await
+        .expect("enroll actor MFA");
         let target = UserStore::create(DB::Conn(&db), "target2@example.com", None, false)
             .await
             .expect("create target");
@@ -1258,10 +1719,99 @@ mod impersonation_authority_tests {
 mod platform_authority_tests {
     use super::*;
     use crate::db::DB;
-    use crate::entities::users;
+    use crate::entities::{prelude::UserTotpSecrets, user_totp_secrets, users};
     use crate::store::users::UserStore;
+    use crate::test_support::{test_config, test_jwt_service};
     use migration::{Migrator, MigratorTrait};
-    use sea_orm::{ActiveModelTrait, Database, Set};
+    use sea_orm::{ActiveModelTrait, ColumnTrait, Database, EntityTrait, QueryFilter, Set};
+
+    async fn enroll_mfa(db: &DatabaseConnection, user_id: &str) {
+        UserTotpSecrets::insert(user_totp_secrets::ActiveModel {
+            id: Set(format!("totp-{user_id}")),
+            user_id: Set(user_id.to_string()),
+            secret_encrypted: Set(vec![]),
+            encryption_key_id: Set("test-key".to_string()),
+            enabled: Set(true),
+            created_at: Set(chrono::Utc::now().naive_utc()),
+            enabled_at: Set(Some(chrono::Utc::now().naive_utc())),
+        })
+        .exec(db)
+        .await
+        .expect("enroll MFA");
+    }
+
+    #[tokio::test]
+    async fn live_platform_authority_requires_context_and_mfa() {
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        let owner = UserStore::create(DB::Conn(&db), "context-owner@example.com", None, true)
+            .await
+            .expect("create owner");
+        enroll_mfa(&db, &owner.id).await;
+
+        let config = test_config();
+        let jwt = test_jwt_service(&config);
+        let platform_token = jwt
+            .create_mfa_verified_token(&owner.id, &owner.email, true, None, None)
+            .expect("platform token");
+        let platform_auth = AuthUser {
+            claims: jwt
+                .validate_token(&platform_token)
+                .expect("platform claims"),
+            user: owner.clone(),
+            permissions: vec![],
+            ip_address: "127.0.0.1".to_string(),
+            user_agent: "platform-authority-test".to_string(),
+            current_session_id: None,
+        };
+        assert!(has_live_platform_authority(&db, &platform_auth)
+            .await
+            .expect("live authority"));
+
+        let tenant_token = jwt
+            .create_token(&owner.id, &owner.email, true, Some("acme"), None)
+            .expect("tenant token");
+        let tenant_auth = AuthUser {
+            claims: jwt.validate_token(&tenant_token).expect("tenant claims"),
+            user: owner.clone(),
+            permissions: vec![],
+            ip_address: "127.0.0.1".to_string(),
+            user_agent: "platform-authority-test".to_string(),
+            current_session_id: None,
+        };
+        assert!(!has_live_platform_authority(&db, &tenant_auth)
+            .await
+            .expect("tenant authority"));
+
+        // Platform context and enrollment are not enough: the current token
+        // must come from the MFA completion flow. A passkey-only platform
+        // session must not inherit platform controls.
+        let passkey_token = jwt
+            .create_token(&owner.id, &owner.email, true, None, None)
+            .expect("passkey-context token");
+        let passkey_auth = AuthUser {
+            claims: jwt.validate_token(&passkey_token).expect("passkey claims"),
+            user: owner.clone(),
+            permissions: vec![],
+            ip_address: "127.0.0.1".to_string(),
+            user_agent: "platform-authority-test".to_string(),
+            current_session_id: None,
+        };
+        assert!(!has_live_platform_authority(&db, &passkey_auth)
+            .await
+            .expect("unverified platform authority"));
+
+        UserTotpSecrets::delete_many()
+            .filter(user_totp_secrets::Column::UserId.eq(&owner.id))
+            .exec(&db)
+            .await
+            .expect("remove MFA");
+        assert!(!has_live_platform_authority(&db, &platform_auth)
+            .await
+            .expect("MFA-removed authority"));
+    }
 
     #[tokio::test]
     async fn platform_authority_uses_current_database_role_not_cached_snapshot() {
@@ -1360,6 +1910,18 @@ mod rate_limiter_tests {
     use super::*;
     use std::net::IpAddr;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn login_attempts_are_keyed_by_normalized_email_and_clear_on_success() {
+        let limiter = LoginAttemptLimiter::new(3, Duration::from_secs(60));
+        for _ in 0..3 {
+            assert!(!limiter.is_rate_limited("User@Example.Test").await);
+            limiter.record_failure("User@Example.Test").await;
+        }
+        assert!(limiter.is_rate_limited("user@example.test").await);
+        limiter.clear("USER@EXAMPLE.TEST").await;
+        assert!(!limiter.is_rate_limited("user@example.test").await);
+    }
 
     #[tokio::test]
     async fn email_rate_limiter_blocks_at_the_cap_and_partitions_by_tenant() {

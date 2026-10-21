@@ -154,6 +154,12 @@ pub async fn register_start(
     Json(req): Json<PasskeyRegisterStartRequest>,
 ) -> Result<impl IntoResponse> {
     let db = DB::Conn(&state.db);
+    crate::middleware::require_recent_authentication(
+        &state.db,
+        &auth_user,
+        chrono::Duration::minutes(10),
+    )
+    .await?;
 
     let user = UserStore::find_by_id(db.clone(), &auth_user.claims.sub)
         .await?
@@ -216,6 +222,12 @@ pub async fn register_finish(
     Json(req): Json<PasskeyRegisterFinishRequest>,
 ) -> Result<impl IntoResponse> {
     let db = DB::Conn(&state.db);
+    crate::middleware::require_recent_authentication(
+        &state.db,
+        &auth_user,
+        chrono::Duration::minutes(10),
+    )
+    .await?;
 
     let user = UserStore::find_by_id(db.clone(), &auth_user.claims.sub)
         .await?
@@ -399,8 +411,12 @@ pub async fn delete_passkey(
 /// Start passkey authentication ceremony (public endpoint)
 pub async fn authenticate_start(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<PasskeyAuthStartRequest>,
 ) -> Result<impl IntoResponse> {
+    if req.org_slug.is_none() && req.service_slug.is_none() && req.redirect_uri.is_none() {
+        crate::middleware::ensure_trusted_platform_origin(&headers, &state.config)?;
+    }
     let db = DB::Conn(&state.db);
 
     let context = if req.org_slug.is_some()
@@ -515,6 +531,7 @@ pub async fn authenticate_start(
 pub async fn authenticate_finish(
     State(state): State<AppState>,
     Extension(request_info): Extension<RequestInfo>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<PasskeyAuthFinishRequest>,
 ) -> Result<impl IntoResponse> {
     let db = DB::Conn(&state.db);
@@ -609,6 +626,14 @@ pub async fn authenticate_finish(
     } else {
         (None, None)
     };
+
+    if auth_context
+        .as_ref()
+        .and_then(|context| context.org_slug.as_deref())
+        .is_none()
+    {
+        crate::middleware::ensure_trusted_platform_origin(&headers, &state.config)?;
+    }
 
     let org_id_opt = org_id_owned
         .as_deref()
@@ -948,6 +973,7 @@ mod tests {
 
         let result = authenticate_start(
             State(state),
+            axum::http::HeaderMap::new(),
             Json(PasskeyAuthStartRequest {
                 email: "member@example.com".to_string(),
                 org_slug: Some("acme".to_string()),
@@ -1067,6 +1093,7 @@ mod tests {
         for email in ["absent@example.com", "owner@example.com"] {
             let result = authenticate_start(
                 State(state.clone()),
+                axum::http::HeaderMap::new(),
                 Json(PasskeyAuthStartRequest {
                     email: email.to_string(),
                     org_slug: None,
@@ -1119,6 +1146,7 @@ mod tests {
                 saml_state: None,
                 device_code_id: None,
                 act: None,
+                bootstrap: None,
                 aud: Some("platform".to_string()),
                 iss: Some("http://localhost:3001".to_string()),
                 scope: None,

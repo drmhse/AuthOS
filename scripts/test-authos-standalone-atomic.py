@@ -82,7 +82,7 @@ class AtomicStandaloneWritesTest(unittest.TestCase):
 
     def test_api_key_output_rejects_symlink_escape(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             data_dir = root / "managed"
             outside = root / "outside"
             data_dir.mkdir()
@@ -97,7 +97,7 @@ class AtomicStandaloneWritesTest(unittest.TestCase):
 
     def test_api_key_output_rejects_final_symlink_and_hardlink(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             data_dir = root / "managed"
             data_dir.mkdir()
             outside = root / "outside.env"
@@ -133,7 +133,7 @@ class AtomicStandaloneWritesTest(unittest.TestCase):
 
     def test_api_key_output_detects_parent_swap_before_write(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             data_dir = root / "managed"
             safe_parent = data_dir / "keys"
             outside = root / "outside"
@@ -156,7 +156,7 @@ class AtomicStandaloneWritesTest(unittest.TestCase):
 
     def test_api_key_output_writes_atomically_through_retained_directory_fd(self):
         with tempfile.TemporaryDirectory() as temporary:
-            data_dir = Path(temporary) / "managed"
+            data_dir = Path(temporary).resolve() / "managed"
             data_dir.mkdir()
             parent_fd, filename, identity = standalone.open_managed_output_parent(
                 data_dir, "keys/service.env"
@@ -177,7 +177,7 @@ class AtomicStandaloneWritesTest(unittest.TestCase):
 
     def test_api_key_output_detects_final_target_swap(self):
         with tempfile.TemporaryDirectory() as temporary:
-            data_dir = Path(temporary) / "managed"
+            data_dir = Path(temporary).resolve() / "managed"
             keys_dir = data_dir / "keys"
             keys_dir.mkdir(parents=True)
             target = keys_dir / "service.env"

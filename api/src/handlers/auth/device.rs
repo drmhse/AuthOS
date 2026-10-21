@@ -264,6 +264,7 @@ pub async fn device_verify(
 /// Device Flow: Exchange device code for token
 pub async fn token_exchange(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<TokenRequest>,
 ) -> Result<Json<TokenResponse>> {
     // Validate grant type
@@ -303,6 +304,9 @@ pub async fn token_exchange(
 
     let device_code =
         device_code.ok_or_else(|| AppError::BadRequest("Invalid device code".to_string()))?;
+    if device_code.org_slug == "platform" && device_code.service_slug == "admin-cli" {
+        crate::middleware::ensure_trusted_platform_origin(&headers, &state.config)?;
+    }
 
     let user_id = device_code
         .user_id
@@ -331,14 +335,29 @@ pub async fn token_exchange(
                 "Platform device authorization requires a current platform owner".to_string(),
             ));
         }
-        // Generate platform JWT for admin CLI
-        let token = state.jwt_service.create_token(
-            &user.id,
-            &user.email,
-            user.is_platform_owner,
-            None,
-            None,
-        )?;
+        // Generate platform JWT for admin CLI. When MFA is enrolled, device
+        // authorization can only complete through the MFA challenge, so carry
+        // the signed MFA-completion marker into the CLI token. If MFA is not
+        // enrolled, the token still cannot pass the platform route boundary.
+        let mfa_enrolled =
+            crate::store::totp::TotpStore::is_enabled(DB::Conn(&state.db), &user.id).await?;
+        let token = if mfa_enrolled {
+            state.jwt_service.create_mfa_verified_token(
+                &user.id,
+                &user.email,
+                user.is_platform_owner,
+                None,
+                None,
+            )?
+        } else {
+            state.jwt_service.create_token(
+                &user.id,
+                &user.email,
+                user.is_platform_owner,
+                None,
+                None,
+            )?
+        };
 
         let refresh_token = crate::crypto::refresh_tokens::generate();
 
@@ -769,6 +788,7 @@ mod tests {
 
         let denied = token_exchange(
             State(state.clone()),
+            axum::http::HeaderMap::new(),
             Json(TokenRequest {
                 client_id: PLATFORM_ADMIN_CLI_CLIENT_ID.to_string(),
                 device_code: code.device_code,
@@ -1054,6 +1074,7 @@ mod tests {
 
         let invalid = token_exchange(
             State(state.clone()),
+            axum::http::HeaderMap::new(),
             Json(TokenRequest {
                 client_id: "client-portal".to_string(),
                 device_code: "device-code".to_string(),
@@ -1069,6 +1090,7 @@ mod tests {
 
         let Json(response) = token_exchange(
             State(state.clone()),
+            axum::http::HeaderMap::new(),
             Json(TokenRequest {
                 client_id: "client-portal".to_string(),
                 device_code: "device-code".to_string(),

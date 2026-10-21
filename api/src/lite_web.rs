@@ -12,6 +12,9 @@ use axum::{
 use include_dir::{include_dir, Dir};
 use mime_guess::from_path;
 use serde::Serialize;
+use tower_governor::{governor::GovernorConfigBuilder, GovernorLayer};
+
+use crate::client_ip::TrustedClientIpKeyExtractor;
 
 static LITE_WEB_DIST: Dir<'_> = include_dir!("$LITE_WEB_DIST_DIR");
 
@@ -21,10 +24,26 @@ struct PublicWebConfigResponse {
     managed_config_enabled: bool,
 }
 
-pub fn routes(_state: &AppState) -> Router<AppState> {
+pub fn routes(state: &AppState) -> Router<AppState> {
+    let bootstrap = Router::new().route("/api/public/bootstrap-login", post(bootstrap_login));
+    let bootstrap = if state.config.disable_rate_limiting {
+        bootstrap
+    } else {
+        bootstrap.layer(GovernorLayer {
+            config: Box::leak(Box::new(
+                GovernorConfigBuilder::default()
+                    .per_millisecond(1000)
+                    .burst_size(10)
+                    .key_extractor(TrustedClientIpKeyExtractor::from_env())
+                    .finish()
+                    .expect("Failed to build bootstrap login rate limiter"),
+            )),
+        })
+    };
+
     Router::new()
         .route("/api/public/web-config", get(public_web_config))
-        .route("/api/public/bootstrap-login", post(bootstrap_login))
+        .merge(bootstrap)
         .route("/assets/*path", get(asset))
         .route("/authorize", get(index))
         .route("/", get(index))

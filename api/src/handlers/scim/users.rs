@@ -86,6 +86,27 @@ fn ensure_scim_can_deprovision_membership(
     Ok(())
 }
 
+/// SCIM is a tenant provisioning interface, not a platform-identity or
+/// privileged-tenant identity recovery interface. It may not rewrite a
+/// platform owner or the email address of an organization owner/admin.
+fn ensure_scim_can_modify_identity(
+    user: &users::Model,
+    membership: &crate::entities::memberships::Model,
+    changing_email: bool,
+) -> Result<()> {
+    if user.is_platform_owner {
+        return Err(AppError::Forbidden(
+            "SCIM cannot modify a platform owner account".to_string(),
+        ));
+    }
+    if changing_email && matches!(membership.role.as_str(), "owner" | "admin") {
+        return Err(AppError::Forbidden(
+            "SCIM cannot change the email address of an organization owner or admin".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 async fn deprovision_scim_user_in_transaction(
     db: DB<'_>,
     audit_actor: &crate::audit::actor::AuditHandle,
@@ -107,6 +128,15 @@ async fn deprovision_scim_user_in_transaction(
     let membership = MembershipStore::find_by_org_and_user(db.clone(), org_id, user_id)
         .await?
         .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
+    let target_user = users::Entity::find_by_id(user_id)
+        .one(&db)
+        .await?
+        .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
+    if target_user.is_platform_owner {
+        return Err(AppError::Forbidden(
+            "SCIM cannot deprovision a platform owner account".to_string(),
+        ));
+    }
     ensure_scim_can_deprovision_membership(&membership)?;
 
     let updated_user = if let Some(email) = deactivate_owned_user {
@@ -175,6 +205,11 @@ async fn deprovision_scim_user_in_transaction(
         &service_ids,
     )
     .await?;
+    if deactivate_owned_user.is_some() {
+        // A SCIM deactivation marks the user row inactive globally. Revoke
+        // every session, including sessions for other tenant memberships.
+        SessionStore::delete_all_for_user(db.clone(), user_id).await?;
+    }
 
     if remove_membership {
         MembershipStore::delete(db.clone(), &membership.id).await?;
@@ -558,6 +593,13 @@ pub async fn update_user(
     };
 
     let email = email.to_lowercase();
+    if let Err(error) = ensure_scim_can_modify_identity(&user, &membership, user.email != email) {
+        return Ok((
+            StatusCode::FORBIDDEN,
+            Json(ScimError::new(403, error.to_string(), None)),
+        )
+            .into_response());
+    }
     if scoped_email_conflict(&state, &scim_auth.org_id, &email, Some(&user.id)).await? {
         let error = ScimError::uniqueness(format!("User with email {} already exists", email));
         return Ok((StatusCode::CONFLICT, Json(error)).into_response());
@@ -589,12 +631,22 @@ pub async fn update_user(
     }
 
     let updated_user = if requested_active {
-        UserStore::update_scim_owned_member(
-            DB::Conn(&state.db),
-            &scim_auth.org_id,
-            &user.id,
-            &email,
-            true,
+        let org_id = scim_auth.org_id.clone();
+        let user_id = user.id.clone();
+        let email = email.clone();
+        with_retrying_transaction(
+            &state.db,
+            #[cfg(feature = "db_sqlite")]
+            &state.db_writer,
+            "scim_update_user",
+            |db| {
+                let org_id = org_id.clone();
+                let user_id = user_id.clone();
+                let email = email.clone();
+                Box::pin(async move {
+                    UserStore::update_scim_owned_member(db, &org_id, &user_id, &email, true).await
+                })
+            },
         )
         .await?
     } else {
@@ -637,6 +689,11 @@ pub async fn update_user(
         )
             .into_response());
     };
+
+    state.user_cache.invalidate(&user.id).await;
+    if !requested_active {
+        state.permission_cache.invalidate(&user.id).await;
+    }
 
     // Note: The users table doesn't store name fields (givenName, familyName)
     // These are provided in SCIM requests but not persisted to the database
@@ -690,6 +747,15 @@ pub async fn patch_user(
         }
     }
 
+    if let Err(error) =
+        ensure_scim_can_modify_identity(&user, &membership, user.email != requested_email)
+    {
+        return Ok((
+            StatusCode::FORBIDDEN,
+            Json(ScimError::new(403, error.to_string(), None)),
+        )
+            .into_response());
+    }
     if scoped_email_conflict(&state, &scim_auth.org_id, &requested_email, Some(&user.id)).await? {
         let error = ScimError::uniqueness(format!(
             "User with email {} already exists",
@@ -720,12 +786,29 @@ pub async fn patch_user(
     }
 
     let updated_user = if requested_active {
-        UserStore::update_scim_owned_member(
-            DB::Conn(&state.db),
-            &scim_auth.org_id,
-            &user.id,
-            &requested_email,
-            true,
+        let org_id = scim_auth.org_id.clone();
+        let user_id = user.id.clone();
+        let requested_email = requested_email.clone();
+        with_retrying_transaction(
+            &state.db,
+            #[cfg(feature = "db_sqlite")]
+            &state.db_writer,
+            "scim_patch_update_user",
+            |db| {
+                let org_id = org_id.clone();
+                let user_id = user_id.clone();
+                let requested_email = requested_email.clone();
+                Box::pin(async move {
+                    UserStore::update_scim_owned_member(
+                        db,
+                        &org_id,
+                        &user_id,
+                        &requested_email,
+                        true,
+                    )
+                    .await
+                })
+            },
         )
         .await?
     } else {
@@ -769,6 +852,11 @@ pub async fn patch_user(
             .into_response());
     };
 
+    state.user_cache.invalidate(&user.id).await;
+    if !requested_active {
+        state.permission_cache.invalidate(&user.id).await;
+    }
+
     let base_url = &state.base_url;
     Ok(Json(user_to_scim(updated_user, base_url)).into_response())
 }
@@ -796,6 +884,11 @@ pub async fn delete_user(
         return Ok((StatusCode::NOT_FOUND, Json(error)).into_response());
     };
 
+    if user.is_platform_owner {
+        return Err(AppError::Forbidden(
+            "SCIM cannot deprovision a platform owner account".to_string(),
+        ));
+    }
     ensure_scim_can_deprovision_membership(&membership)?;
 
     let org_id = scim_auth.org_id.clone();
@@ -824,6 +917,8 @@ pub async fn delete_user(
         },
     )
     .await?;
+    state.user_cache.invalidate(&user.id).await;
+    state.permission_cache.invalidate(&user.id).await;
 
     Ok(StatusCode::NO_CONTENT.into_response())
 }

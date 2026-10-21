@@ -5,7 +5,7 @@ use crate::error::{AppError, Result};
 use chrono::{NaiveDate, NaiveDateTime};
 use sea_orm::{
     sea_query::{Expr, Query},
-    ActiveModelTrait, ColumnTrait, Condition, EntityTrait, FromQueryResult, PaginatorTrait,
+    ActiveModelTrait, ColumnTrait, Condition, EntityTrait, FromQueryResult, NotSet, PaginatorTrait,
     QueryFilter, QueryOrder, QuerySelect, Set,
 };
 use uuid::Uuid;
@@ -144,6 +144,17 @@ impl UserStore {
         email: &str,
         active: bool,
     ) -> Result<Option<users::Model>> {
+        let Some(current) = Users::find()
+            .filter(users::Column::Id.eq(user_id))
+            .filter(users::Column::OrgId.eq(org_id))
+            .filter(users::Column::IsPlatformOwner.eq(false))
+            .one(&db)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let email_changed = current.email != email;
+
         let mut membership_scope = Query::select();
         membership_scope
             .expr(Expr::val(1))
@@ -160,9 +171,11 @@ impl UserStore {
         let result = Users::update_many()
             .filter(users::Column::Id.eq(user_id))
             .filter(users::Column::OrgId.eq(org_id))
+            .filter(users::Column::IsPlatformOwner.eq(false))
             .filter(Expr::exists(membership_scope.clone()))
             .set(users::ActiveModel {
                 email: Set(email.to_string()),
+                email_verified_at: if email_changed { Set(None) } else { NotSet },
                 deleted_at: Set(if active { None } else { Some(now) }),
                 updated_at: Set(Some(now)),
                 ..Default::default()
@@ -172,6 +185,22 @@ impl UserStore {
 
         if result.rows_affected != 1 {
             return Ok(None);
+        }
+
+        if email_changed {
+            crate::store::email_verification::EmailVerificationStore::delete_all_for_user(
+                db.clone(),
+                user_id,
+            )
+            .await?;
+            crate::store::password_reset::PasswordResetStore::delete_all_for_user(
+                db.clone(),
+                user_id,
+            )
+            .await?;
+            crate::store::magic_links::MagicLinksStore::delete_all_for_user(db.clone(), user_id)
+                .await?;
+            crate::store::sessions::SessionStore::delete_all_for_user(db.clone(), user_id).await?;
         }
 
         Ok(Users::find()
@@ -418,19 +447,28 @@ impl UserStore {
         let user = Self::find_by_id(db.clone(), user_id)
             .await?
             .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
+        if user.email == new_email {
+            return Ok(user);
+        }
 
         let mut user_active: users::ActiveModel = user.into();
         user_active.email = Set(new_email.to_string());
+        // A changed address is not the address that was previously verified.
+        // Force the verification flow before password login can succeed again.
+        user_active.email_verified_at = Set(None);
         user_active.updated_at = Set(Some(chrono::Utc::now().naive_utc()));
 
         let updated_user = user_active.update(&db).await?;
+        crate::store::magic_links::MagicLinksStore::delete_all_for_user(db, user_id).await?;
         Ok(updated_user)
     }
 
-    /// Count platform owners
+    /// Count active platform owners. Soft-deleted owners cannot authorize a
+    /// demotion that would otherwise leave the platform without a live owner.
     pub async fn count_platform_owners(db: DB<'_>) -> Result<u64> {
         let count = Users::find()
             .filter(users::Column::IsPlatformOwner.eq(true))
+            .filter(users::Column::DeletedAt.is_null())
             .count(&db)
             .await?;
         Ok(count)
@@ -703,6 +741,16 @@ impl UserStore {
         UserTotpSecrets::delete_many()
             .filter(crate::entities::user_totp_secrets::Column::UserId.eq(user_id))
             .exec(&db)
+            .await?;
+
+        crate::store::email_verification::EmailVerificationStore::delete_all_for_user(
+            db.clone(),
+            user_id,
+        )
+        .await?;
+        crate::store::password_reset::PasswordResetStore::delete_all_for_user(db.clone(), user_id)
+            .await?;
+        crate::store::magic_links::MagicLinksStore::delete_all_for_user(db.clone(), user_id)
             .await?;
 
         // Anonymisation must log the user out everywhere.

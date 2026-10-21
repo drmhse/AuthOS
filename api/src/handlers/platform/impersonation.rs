@@ -1,7 +1,8 @@
 //! Impersonation Handlers
 //!
-//! Implements platform impersonation functionality following RFC 8693 (Token Exchange)
-//! Allows platform owners and organization admins to impersonate users for support purposes.
+//! Implements platform impersonation functionality following RFC 8693 (Token Exchange).
+//! Only platform owners may impersonate users; tenant administrators cannot
+//! mint tokens that cross tenant boundaries.
 
 use crate::crypto::jwt::JwtService;
 use crate::db::transaction::with_retrying_transaction;
@@ -18,10 +19,9 @@ use axum::{
     response::Json as AxumJson,
 };
 use chrono::Utc;
-use sea_orm::{EntityTrait, Set};
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, Set};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::HashSet;
 use uuid::Uuid;
 
 /// Request to impersonate a user
@@ -58,9 +58,9 @@ pub struct UserInfo {
 
 /// Mint a short-lived token acting as another user.
 ///
-/// Platform owners may impersonate anyone, org admins only within their own org.
-/// TTL is 15 minutes and every action is audited at HIGH severity with actor
-/// context, so the real principal stays attributable.
+/// Platform owners may impersonate any user. TTL is 15 minutes and every
+/// action is audited at HIGH severity with actor context, so the real principal
+/// stays attributable.
 pub async fn impersonate_user(
     State(state): State<AppState>,
     Extension(auth_user): Extension<AuthUser>,
@@ -72,50 +72,21 @@ pub async fn impersonate_user(
 
     // Validate the target user exists and get their details
     let target_user = users_entity::Entity::find_by_id(request.user_id.clone())
+        .filter(users_entity::Column::DeletedAt.is_null())
         .one(db)
         .await?
         .ok_or_else(|| AppError::NotFound("Target user not found".to_string()))?;
 
-    // Check authorization based on platform owner status or org admin status.
-    // Org admins are scoped to the shared organization they administer; they
-    // must not inherit a different tenant context from the target's memberships.
-    let (can_impersonate, impersonation_org) = if auth_user.user.is_platform_owner {
-        (true, None)
-    } else {
-        if target_user.is_platform_owner {
-            return Err(AppError::Forbidden(
-                "Only platform owners can impersonate platform owners".to_string(),
-            ));
-        }
-
-        // Check if target user is in the same organization and auth user is an org admin.
-        let target_memberships =
-            MembershipStore::list_by_user(DB::Conn(db), &target_user.id).await?;
-        let admin_org_ids = MembershipStore::list_by_user(DB::Conn(db), &auth_user.user.id)
-            .await?
-            .into_iter()
-            .filter(|membership| membership.role == "owner" || membership.role == "admin")
-            .map(|membership| membership.org_id)
-            .collect::<HashSet<_>>();
-
-        let mut authorized_org = None;
-
-        for membership in target_memberships {
-            if admin_org_ids.contains(&membership.org_id) {
-                authorized_org =
-                    OrganizationStore::find_by_id(DB::Conn(db), &membership.org_id).await?;
-                break;
-            }
-        }
-
-        (authorized_org.is_some(), authorized_org)
-    };
-
-    if !can_impersonate {
+    // The route boundary already requires a platform-context token. Keep the
+    // handler-level check as defense in depth so direct handler use cannot
+    // create an impersonation token from an ordinary tenant session.
+    if !crate::middleware::has_live_platform_authority(db, &auth_user).await? {
         return Err(AppError::Forbidden(
-            "You don't have permission to impersonate this user".to_string(),
+            "A current platform owner with MFA enrollment is required to impersonate users"
+                .to_string(),
         ));
     }
+    let impersonation_org: Option<crate::entities::organizations::Model> = None;
 
     // Get target user's organization and permission context
     let target_memberships = MembershipStore::list_by_user(DB::Conn(db), &target_user.id).await?;

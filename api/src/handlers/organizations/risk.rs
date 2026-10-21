@@ -56,7 +56,7 @@ pub async fn get_risk_events(
     axum::extract::State(state): axum::extract::State<crate::AppState>,
 ) -> Result<Json<Vec<RiskEventResponse>>> {
     use crate::store::organizations::OrganizationStore;
-    let user = auth_user.user;
+    let user = &auth_user.user;
 
     // Resolve Org Slug to ID
     let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
@@ -67,15 +67,10 @@ pub async fn get_risk_events(
 
     let org_id = org.id;
 
-    // Authorization. A token/cache snapshot is insufficient for global authority.
-    let has_live_platform_authority = if user.is_platform_owner {
-        crate::store::users::UserStore::find_by_id(DB::Conn(&state.db), &user.id)
-            .await?
-            .is_some_and(|current| current.is_platform_owner && current.deleted_at.is_none())
-    } else {
-        false
-    };
-    if !has_live_platform_authority {
+    // Authorization. A token/cache snapshot is insufficient for global
+    // authority, and platform authority is only accepted from a
+    // platform-context token with live MFA enrollment.
+    if !crate::middleware::has_live_platform_authority(&state.db, &auth_user).await? {
         let can_view = PermissionService::check_any(
             DB::Conn(&state.db),
             &org_id,

@@ -368,6 +368,7 @@ mod tests {
                 saml_state: None,
                 device_code_id: None,
                 act: None,
+                bootstrap: None,
                 aud: Some(format!("org:{}", org.slug)),
                 iss: Some(state.base_url.clone()),
                 scope: None,

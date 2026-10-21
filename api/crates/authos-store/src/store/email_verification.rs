@@ -40,6 +40,17 @@ impl EmailVerificationStore {
         Ok(token)
     }
 
+    /// Invalidate every outstanding verification token for a user. Used when
+    /// the email address changes so a token issued for the previous address
+    /// cannot verify the replacement address.
+    pub async fn delete_all_for_user(db: DB<'_>, user_id: &str) -> Result<u64> {
+        let result = EmailVerificationTokens::delete_many()
+            .filter(email_verification_tokens::Column::UserId.eq(user_id))
+            .exec(&db)
+            .await?;
+        Ok(result.rows_affected)
+    }
+
     /// Mark an email verification token as used
     pub async fn mark_as_used(db: DB<'_>, token_hash: &str) -> Result<bool> {
         let now = chrono::Utc::now().naive_utc();

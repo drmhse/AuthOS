@@ -86,6 +86,17 @@ impl MagicLinksStore {
         Ok(result.rows_affected == 1)
     }
 
+    /// Invalidate every outstanding magic link for a user. Email changes must
+    /// not leave a link addressed to the previous mailbox usable against the
+    /// account.
+    pub async fn delete_all_for_user(db: DB<'_>, user_id: &str) -> Result<u64> {
+        let result = MagicLinkTokens::delete_many()
+            .filter(magic_link_tokens::Column::UserId.eq(user_id))
+            .exec(&db)
+            .await?;
+        Ok(result.rows_affected)
+    }
+
     /// Clean up expired magic link tokens (for background job)
     pub async fn cleanup_expired(db: DB<'_>) -> Result<u64> {
         let now = Utc::now().naive_utc();
@@ -151,6 +162,69 @@ mod tests {
         assert!(MagicLinksStore::find_by_token(DB::Conn(&db), &token)
             .await
             .expect("reload token")
+            .is_none());
+
+        db.close().await.expect("close sqlite");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn email_change_can_invalidate_every_link_for_the_user() {
+        let path = std::env::temp_dir().join(format!("authos-magic-{}.db", uuid::Uuid::new_v4()));
+        let db = Database::connect(format!("sqlite://{}?mode=rwc", path.display()))
+            .await
+            .expect("connect sqlite");
+        Migrator::up(&db, None).await.expect("run migrations");
+        let first_user =
+            crate::store::users::UserStore::create(DB::Conn(&db), "old@example.test", None, false)
+                .await
+                .expect("create first user");
+        let second_user = crate::store::users::UserStore::create(
+            DB::Conn(&db),
+            "other@example.test",
+            None,
+            false,
+        )
+        .await
+        .expect("create second user");
+        let first = MagicLinksStore::create(
+            DB::Conn(&db),
+            "old@example.test",
+            Some(&first_user.id),
+            "{}",
+        )
+        .await
+        .expect("create first magic link");
+        let second = MagicLinksStore::create(
+            DB::Conn(&db),
+            "old@example.test",
+            Some(&first_user.id),
+            "{}",
+        )
+        .await
+        .expect("create second magic link");
+        MagicLinksStore::create(
+            DB::Conn(&db),
+            "other@example.test",
+            Some(&second_user.id),
+            "{}",
+        )
+        .await
+        .expect("create unrelated magic link");
+
+        assert_eq!(
+            MagicLinksStore::delete_all_for_user(DB::Conn(&db), &first_user.id)
+                .await
+                .expect("delete user links"),
+            2
+        );
+        assert!(MagicLinksStore::find_by_token(DB::Conn(&db), &first)
+            .await
+            .expect("reload first")
+            .is_none());
+        assert!(MagicLinksStore::find_by_token(DB::Conn(&db), &second)
+            .await
+            .expect("reload second")
             .is_none());
 
         db.close().await.expect("close sqlite");

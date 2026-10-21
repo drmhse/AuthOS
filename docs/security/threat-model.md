@@ -250,9 +250,12 @@ are satisfied. Objective 8 remains primarily an operational-readiness item.
   proving its permission and resource binding.
 - Tenant administration handlers generally resolve an organization from the
   path and then require membership, built-in role, or a relationship-tuple
-  capability. The inventory records the full surface. Because enforcement is
-  distributed across handlers and stores, comprehensive negative tests are a
-  release requirement rather than an inferred guarantee.
+  capability. Service-login tokens are further restricted to profile and
+  subscription reads. Platform owner bypasses require a platform-context token,
+  a live owner row, enrolled MFA, and proof that the current login completed the
+  MFA challenge; passkey-only and refreshed platform sessions are rejected. The
+  inventory records the full surface; comprehensive negative tests remain a
+  release requirement.
 
 ## Prioritized abuse cases
 

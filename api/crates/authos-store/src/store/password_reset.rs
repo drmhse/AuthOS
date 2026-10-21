@@ -40,6 +40,15 @@ impl PasswordResetStore {
         Ok(token)
     }
 
+    /// Invalidate every outstanding password-reset token for a user.
+    pub async fn delete_all_for_user(db: DB<'_>, user_id: &str) -> Result<u64> {
+        let result = PasswordResetTokens::delete_many()
+            .filter(password_reset_tokens::Column::UserId.eq(user_id))
+            .exec(&db)
+            .await?;
+        Ok(result.rows_affected)
+    }
+
     /// Mark a password reset token as used
     pub async fn mark_as_used(db: DB<'_>, token_hash: &str) -> Result<bool> {
         let now = chrono::Utc::now().naive_utc();

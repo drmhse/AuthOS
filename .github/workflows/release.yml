@@ -41,12 +41,15 @@ jobs:
           }
           const [, body] = payload.value.split('.');
           console.log('OIDC claims:', Buffer.from(body, 'base64url').toString('utf8'));
-          const exchange = await fetch(
-            'https://registry.npmjs.org/-/npm/v1/oidc/token/exchange/package/%40drmhse%2Fsso-sdk',
-            { method: 'POST', headers: { authorization: `Bearer ${payload.value}` } },
-          );
-          console.log('Exchange status:', exchange.status);
-          console.log('Exchange body:', await exchange.text());
+          for (const encoded of ['@drmhse%2fsso-sdk', '%40drmhse%2Fsso-sdk']) {
+            const exchange = await fetch(
+              `https://registry.npmjs.org/-/npm/v1/oidc/token/exchange/package/${encoded}`,
+              { method: 'POST', headers: { authorization: `Bearer ${payload.value}` } },
+            );
+            console.log('Exchange path:', encoded);
+            console.log('Exchange status:', exchange.status);
+            console.log('Exchange body:', await exchange.text());
+          }
           NODE
 
   qualify:

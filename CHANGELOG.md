@@ -49,6 +49,10 @@ project is pre-1.0; breaking changes are called out explicitly when known.
   credential mutation, and disabling MFA is refused when no factor is enabled.
 - Platform admin CLI device authorization carries the MFA-completion marker
   when the owner has an enrolled factor.
+- Dependency security updates: `hickory-resolver` 0.26.3, `quinn-proto`
+  0.11.19, `rustls` 0.23.46, `rustls-webpki` 0.103.16, the webpki root bundles,
+  `vite` 8.3.5, and `vitest` 4.1.12. `cargo audit` reports no vulnerabilities;
+  npm audit reports no vulnerabilities in the full or production trees.
 - Password-registration invitations are accepted only after email verification,
   not at account creation. Platform-owner email changes must go through managed
   platform configuration so the configured bootstrap/admin OAuth identity does

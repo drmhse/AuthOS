@@ -3,7 +3,7 @@
 This file records notable user-facing and project-level changes to AuthOS. The
 project is pre-1.0; breaking changes are called out explicitly when known.
 
-## 0.8.14 - 2026-10-21
+## 0.8.15 - 2026-10-21
 
 ### Security
 
@@ -81,8 +81,11 @@ project is pre-1.0; breaking changes are called out explicitly when known.
 ### Fixed
 
 - npm publication uses GitHub OIDC trusted publishing instead of the expired
-  long-lived `NPM_TOKEN`. The v0.8.13 release reached the draft stage but failed
-  to publish npm packages; v0.8.14 is the recovery release.
+  long-lived `NPM_TOKEN`. v0.8.13 and the v0.8.14 draft both reached the draft
+  stage but failed at npm publication; v0.8.15 is the recovery release. The
+  publish job no longer configures `setup-node` with `registry-url` (which
+  exports a placeholder token) and explicitly unsets `NODE_AUTH_TOKEN` before
+  `npm publish`, so npm exchanges the job's OIDC token for a one-off credential.
 
 ## 0.8.13 - 2026-09-29
 
@@ -564,8 +567,8 @@ project is pre-1.0; breaking changes are called out explicitly when known.
 Earlier pre-1.0 history is available from
 [GitHub Releases](https://github.com/drmhse/AuthOS/releases).
 
-[Unreleased]: https://github.com/drmhse/AuthOS/compare/v0.8.14...HEAD
-[0.8.14]: https://github.com/drmhse/AuthOS/compare/v0.8.13...v0.8.14
+[Unreleased]: https://github.com/drmhse/AuthOS/compare/v0.8.15...HEAD
+[0.8.15]: https://github.com/drmhse/AuthOS/compare/v0.8.14...v0.8.15
 [0.8.6]: https://github.com/drmhse/AuthOS/compare/v0.8.5...v0.8.6
 [0.8.5]: https://github.com/drmhse/AuthOS/compare/v0.8.4...v0.8.5
 [0.8.4]: https://github.com/drmhse/AuthOS/compare/v0.8.3...v0.8.4

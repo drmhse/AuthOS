@@ -85,10 +85,11 @@
       "sqlite_evidence": [
         "store::organization_billing_credentials::tests::billing_credential_mutations_are_org_scoped_and_preserve_other_tenant",
         "handlers::webhook::tests::subscription_webhook_rejects_cross_tenant_metadata_and_preserves_state",
-        "handlers::organizations::billing_credentials::tests::billing_credentials_authority_honors_scoped_capability_and_revocation"
+        "handlers::organizations::billing_credentials::tests::billing_credentials_authority_honors_scoped_capability_and_revocation",
+        "handlers::organizations::billing_credentials::route_tests::billing_credentials_routes_require_billing_authority_and_are_org_scoped",
+        "handlers::organizations::billing_credentials::route_tests::billing_info_and_portal_require_billing_capability"
       ],
       "open_gaps": [
-        "critical: handler owner/custom-role/non-member tests and external-customer substitution beyond subscription metadata",
         "high: provider callback/webhook concurrency and customer-creation races",
         "high: PostgreSQL and MySQL parity"
       ]

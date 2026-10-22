@@ -22,7 +22,7 @@ authoritative milestone rules in [PRODUCTION_READINESS.md](../../PRODUCTION_READ
 | Rust test cases | **305** in the `sso` suite plus workspace suites |
 | Strict Clippy / formatting | Passing |
 | Release metadata, docs, tenant, backup, audit, redaction, and related checks | Passing |
-| Protected `main` CI/Security runs | **18** consecutive green runs |
+| Protected `main` CI/Security runs | **20** consecutive green runs |
 | Daily restore-qualification workflow | Configured; first manual run passed for SQLite, PostgreSQL 16, and MySQL 8.4 |
 | 30-day restore window | Open; starts with scheduled runs |
 | PostgreSQL/MySQL matrix parity | Not complete |

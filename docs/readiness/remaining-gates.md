@@ -113,7 +113,8 @@ The local workspace cannot truthfully manufacture these results:
 ## Requires elapsed evidence
 
 - twenty consecutive protected security/quality runs with negative controls
-  shown to block merge;
+  shown to block merge; the 20-run window completed on 2026-10-22 for CI and
+  Security, and the negative-control demonstrations remain open;
 - thirty consecutive scheduled restore results plus two measured recovery
   drills for every deployment mode that receives an RPO/RTO claim; the daily
   workflow is configured, but the consecutive-result window has not completed;

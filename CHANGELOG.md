@@ -19,6 +19,8 @@ project is pre-1.0; breaking changes are called out explicitly when known.
 
 ### Changed
 
+- The protected CI and Security windows reached **20 consecutive green runs**
+  on 2026-10-22. Negative-control merge-blocking demonstrations remain open.
 - `main` now requires the CI and Security checks, pull requests, and
   conversation resolution; `v*` tags are protected from deletion and
   non-fast-forward updates; and release publication pauses for approval in the

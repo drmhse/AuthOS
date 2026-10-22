@@ -552,6 +552,20 @@ jobs:
             --generate-notes \
             --title "${RELEASE_TAG}"
 
+  release_approval:
+    name: Approve coordinated release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: create_draft_release
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+    steps:
+      - name: Record approval
+        run: |
+          echo "Release ${GITHUB_REF_NAME} approved for publication."
+          echo "The release environment requires a reviewer before any registry write."
+
   package_standalone:
     name: Prepare standalone release assets
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
@@ -615,7 +629,7 @@ jobs:
   publish_standalone:
     name: Attest and attach standalone release assets
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    needs: [package_standalone, create_draft_release]
+    needs: [package_standalone, create_draft_release, release_approval]
     runs-on: ubuntu-latest
     permissions:
       artifact-metadata: write
@@ -929,7 +943,7 @@ jobs:
   publish_docker:
     name: Publish prepared ${{ matrix.backend }} image
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    needs: [package_docker, publish_npm]
+    needs: [package_docker, publish_npm, release_approval]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -1038,7 +1052,7 @@ jobs:
   publish_npm:
     name: Publish coordinated npm artifacts
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    needs: [prepare_npm, publish_standalone]
+    needs: [prepare_npm, publish_standalone, release_approval]
     uses: ./.github/workflows/publish-npm-packages.yml
     with:
       mode: publish

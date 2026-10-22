@@ -41,8 +41,10 @@ documented current release, and bootstrap Docker pins.
    publication uses GitHub OIDC trusted publishing, not a long-lived registry
    token.
 4. Only after that gate succeeds does the workflow create a draft GitHub
-   release and invoke small artifact-only publication jobs. Source builds do
-   not receive registry credentials, a contents-write token, or OIDC authority.
+   release and invoke small artifact-only publication jobs. Before the first
+   registry write, the workflow pauses at the protected `release` environment
+   for maintainer approval. Source builds do not receive registry credentials,
+   a contents-write token, or OIDC authority.
 5. The draft becomes public only after standalone assets, all three Docker
    variants, all five npm packages, attestations, and durable evidence succeed.
 6. The maintainer verifies the GitHub release assets and checksums, Docker
@@ -61,9 +63,14 @@ direct manual dispatch is unconditionally dry-run-only and receives no npm
 credential. Immutable npm and Docker version tags must all be absent before
 publication, and existing GitHub release assets are never overwritten.
 
-These are configured candidate controls, not completed release evidence. They
-become evidence only after the workflow is committed, protected, and succeeds
-for an exact release tag with its retained logs, manifests, and attestations.
+These are configured candidate controls, not completed release evidence. The
+`v0.8.16` workflow completed, and its retained standalone/npm manifests pass
+the clean-environment verifiers. `main` now requires the CI and Security
+checks, pull requests, and conversation resolution; `v*` tags are protected
+from deletion and non-fast-forward updates; and publication pauses for
+approval in the `release` environment. The 20 consecutive protected-run
+criterion, a second maintainer for independent review, and the remaining
+release checklist evidence are still required.
 
 Registry publication is deliberately sequenced, but it is not transactional.
 An npm or Docker outage can leave a strict subset public after the first write.

@@ -1,0 +1,190 @@
+name: Restore qualification
+
+on:
+  schedule:
+    # Daily at 03:37 UTC. The 30-consecutive-day evidence window for v1.0
+    # depends on this workflow, so keep the schedule stable once published.
+    - cron: '37 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: restore-qualification
+  cancel-in-progress: false
+
+jobs:
+  sqlite:
+    name: SQLite backup and restored runtime
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: api -> target
+          shared-key: restore-qualification-sqlite
+
+      - name: Build SQLite binary
+        working-directory: api
+        env:
+          AUTHOS_BUILD_VERSION: restore-qualification-sqlite
+        run: >-
+          cargo build --locked --bin sso_sqlite --no-default-features
+          --features db_sqlite
+
+      - name: Exercise SQLite backup and restored runtime
+        env:
+          AUTHOS_BINARY: api/target/debug/sso_sqlite
+        run: |
+          set -o pipefail
+          bash scripts/qualify-sqlite-backup-restore.sh 2>&1 | tee restore-qualification-sqlite.log
+
+      - name: Upload SQLite restore evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: restore-qualification-sqlite-${{ github.run_id }}
+          path: restore-qualification-sqlite.log
+          retention-days: 90
+          if-no-files-found: warn
+
+  postgres:
+    name: PostgreSQL 16 runtime and logical restore
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: authos_runtime
+          POSTGRES_USER: authos_runtime
+          POSTGRES_PASSWORD: authos_runtime_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U authos_runtime -d authos_runtime"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: api -> target
+          shared-key: restore-qualification-postgres-16
+
+      - name: Build PostgreSQL binary
+        working-directory: api
+        env:
+          AUTHOS_BUILD_VERSION: restore-qualification-postgres-16
+        run: >-
+          cargo build --locked --bin sso_psql --no-default-features
+          --features db_psql
+
+      - name: Install PostgreSQL backup client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+
+      - name: Exercise PostgreSQL runtime and logical restore
+        env:
+          AUTHOS_BACKEND: postgres
+          AUTHOS_BINARY: api/target/debug/sso_psql
+          DATABASE_URL: postgres://authos_runtime:authos_runtime_password@127.0.0.1:5432/authos_runtime
+          AUTHOS_DB_PASSWORD: authos_runtime_password
+        run: |
+          set -o pipefail
+          bash scripts/qualify-logical-backup-restore.sh 2>&1 | tee restore-qualification-postgres.log
+
+      - name: Upload PostgreSQL restore evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: restore-qualification-postgres-${{ github.run_id }}
+          path: restore-qualification-postgres.log
+          retention-days: 90
+          if-no-files-found: warn
+
+  mysql:
+    name: MySQL 8.4 runtime and logical restore
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_DATABASE: authos_runtime
+          MYSQL_USER: authos_runtime
+          MYSQL_PASSWORD: authos_runtime_password
+          MYSQL_ROOT_PASSWORD: authos_runtime_root_password
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -pauthos_runtime_root_password --silent"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: api -> target
+          shared-key: restore-qualification-mysql-8-4
+
+      - name: Build MySQL binary
+        working-directory: api
+        env:
+          AUTHOS_BUILD_VERSION: restore-qualification-mysql-8.4
+        run: >-
+          cargo build --locked --bin sso_mysql --no-default-features
+          --features db_mysql
+
+      - name: Install MySQL backup client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y default-mysql-client
+
+      - name: Exercise MySQL runtime and logical restore
+        env:
+          AUTHOS_BACKEND: mysql
+          AUTHOS_BINARY: api/target/debug/sso_mysql
+          DATABASE_URL: mysql://authos_runtime:authos_runtime_password@127.0.0.1:3306/authos_runtime
+          AUTHOS_DB_PASSWORD: authos_runtime_password
+        run: |
+          set -o pipefail
+          bash scripts/qualify-logical-backup-restore.sh 2>&1 | tee restore-qualification-mysql.log
+
+      - name: Upload MySQL restore evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: restore-qualification-mysql-${{ github.run_id }}
+          path: restore-qualification-mysql.log
+          retention-days: 90
+          if-no-files-found: warn

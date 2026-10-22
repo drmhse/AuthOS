@@ -3,11 +3,13 @@
 AuthOS includes an integrity-checked SQLite database snapshot helper, but it
 does not yet have a complete deployment-state backup command, point-in-time
 recovery guarantee, RPO, or RTO. The procedures below match the repository's
-current storage layout and database containers. The CI workflows are configured
-to run SQLite snapshot/restored-runtime checks and PostgreSQL/MySQL logical
-dump-and-restore journeys, but those source definitions are not evidence of a
-successful protected run. Complete deployment-state and repeated
-disaster-recovery drills have not accumulated the evidence required for a
+current storage layout and database containers. CI runs SQLite
+snapshot/restored-runtime checks and PostgreSQL/MySQL logical dump-and-restore
+journeys on pull requests. The scheduled `Restore qualification` workflow runs
+the same three journeys daily and retains each log for 90 days. Those source
+definitions are not evidence until successful runs accumulate; the
+30-consecutive-day window, complete deployment-state coverage, and repeated
+disaster-recovery drills have not yet produced the evidence required for a
 recovery guarantee.
 
 ## What a recoverable backup must contain

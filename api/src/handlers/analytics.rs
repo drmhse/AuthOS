@@ -643,11 +643,12 @@ mod route_tests {
                 "magic",
                 0,
             ),
+            ("analytics-route-null-org", "", None, "mfa", 0),
         ] {
             login_events::ActiveModel {
                 id: Set(id.to_string()),
                 user_id: Set(owner.id.clone()),
-                service_id: Set(Some(service_id.to_string())),
+                service_id: Set((!service_id.is_empty()).then(|| service_id.to_string())),
                 org_id: Set(org_id.map(str::to_string)),
                 provider: Set(provider.to_string()),
                 created_at: Set(now - chrono::Duration::days(days_ago)),

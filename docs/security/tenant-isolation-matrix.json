@@ -153,10 +153,12 @@
         "handlers::scim::users::deprovision_tests::deprovision_audit_failure_rolls_back_all_authority_changes",
         "handlers::scim::tests::suspended_parent_rejects_every_scim_route_before_handler_state_changes",
         "handlers::scim::tests::optional_organization_header_must_be_absent_or_exactly_match_token_scope",
-        "store::scim_tokens::tests::scim_token_lifecycle_is_org_scoped_and_preserves_other_tenant"
+        "store::scim_tokens::tests::scim_token_lifecycle_is_org_scoped_and_preserves_other_tenant",
+        "handlers::organizations::scim_tokens::route_tests::scim_token_routes_require_live_integration_authority",
+        "handlers::organizations::scim_tokens::route_tests::scim_token_creation_rejects_invalid_expiry_without_persisting",
+        "handlers::organizations::scim_tokens::route_tests::suspended_parent_denies_every_scim_token_route_without_state_changes"
       ],
       "open_gaps": [
-        "critical: complete token lifecycle actor/status route matrix and remaining resource-ID cases",
         "high: PostgreSQL and MySQL route-suite parity"
       ]
     },

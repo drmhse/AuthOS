@@ -120,7 +120,7 @@
         "handlers::organization_audit::route_tests::audit_routes_require_live_scoped_capability_and_scope_filters"
       ],
       "open_gaps": [
-        "high: remaining PII/free-form metadata policy, null-org MFA rows, and unchanged-state/export assertions",
+        "high: remaining PII/free-form metadata policy and unchanged-state/export assertions",
         "high: PostgreSQL and MySQL parity"
       ]
     },

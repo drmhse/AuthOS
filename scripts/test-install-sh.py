@@ -58,6 +58,57 @@ cp "$AUTHOS_TEST_FIXTURE/$(basename "$url")" "$output"
         )
         fake_curl.chmod(0o755)
 
+        # The installer targets Linux and uses GNU sha256sum flags. Provide a
+        # deterministic GNU-compatible implementation so this test also runs
+        # on macOS/BSD development hosts without depending on coreutils.
+        fake_sha256sum = self.bin_dir / "sha256sum"
+        fake_sha256sum.write_text(
+            """#!/usr/bin/env python3
+import hashlib
+import pathlib
+import sys
+
+args = [arg for arg in sys.argv[1:] if not arg.startswith("-")]
+check = "--check" in sys.argv[1:] or "-c" in sys.argv[1:]
+
+if check:
+    ok = True
+    for line in sys.stdin:
+        line = line.rstrip("\\n")
+        if not line:
+            continue
+        parts = line.split(None, 1)
+        if len(parts) != 2:
+            print("invalid checksum line", file=sys.stderr)
+            ok = False
+            continue
+        expected, filename = parts
+        filename = filename.lstrip("*")
+        try:
+            actual = hashlib.sha256(pathlib.Path(filename).read_bytes()).hexdigest()
+        except OSError as error:
+            print(f"{filename}: FAILED ({error})", file=sys.stderr)
+            ok = False
+            continue
+        if actual == expected:
+            print(f"{filename}: OK")
+        else:
+            print(f"{filename}: FAILED", file=sys.stderr)
+            ok = False
+    sys.exit(0 if ok else 1)
+
+for filename in args:
+    try:
+        digest = hashlib.sha256(pathlib.Path(filename).read_bytes()).hexdigest()
+    except OSError as error:
+        print(f"sha256sum: {filename}: {error}", file=sys.stderr)
+        sys.exit(1)
+    print(f"{digest}  {filename}")
+""",
+            encoding="utf-8",
+        )
+        fake_sha256sum.chmod(0o755)
+
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
@@ -125,6 +176,16 @@ cp "$AUTHOS_TEST_FIXTURE/$(basename "$url")" "$output"
                 result = self.run_installer()
                 self.assertNotEqual(result.returncode, 0)
                 self.assertFalse(self.marker.exists())
+
+    def test_rejects_mismatched_archive_checksum(self) -> None:
+        self.build_archive()
+        archive = self.fixture / ARCHIVE
+        archive.write_bytes(archive.read_bytes() + b"tampered")
+
+        result = self.run_installer()
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.marker.exists())
 
     def test_rejects_duplicate_checksum_entry_and_invalid_tag(self) -> None:
         self.build_archive()

@@ -28,6 +28,9 @@ project is pre-1.0; breaking changes are called out explicitly when known.
 
 ### Fixed
 
+- The installer archive test harness now provides a GNU-compatible
+  `sha256sum` and covers a tampered archive, so `check:bootstrap` runs on
+  macOS/BSD hosts without coreutils.
 - Release finalization now polls the npm registry for up to 15 minutes before
   making the draft public. v0.8.16 published all five packages successfully,
   but npm's registry took several minutes to expose `@drmhse/authos-react`,

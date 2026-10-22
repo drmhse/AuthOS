@@ -287,6 +287,8 @@ mod tests {
         events::EventDispatcher, metrics::MfaMetricsService, risk_engine::RiskEngine,
     };
     use crate::store::{
+        memberships::MembershipStore,
+        organization_roles::OrganizationRoleStore,
         organizations::OrganizationStore,
         users::{UserCreationOptions, UserStore},
     };
@@ -714,5 +716,186 @@ mod tests {
             .expect("domain remains");
         assert_eq!(preserved.login_policy, DOMAIN_LOGIN_POLICY_PASSWORD_ALLOWED);
         assert_eq!(preserved.org_id, org.id);
+    }
+
+    #[tokio::test]
+    async fn domain_route_actor_matrix_requires_live_integration_authority() {
+        let (state, owner, org_slug) = setup_state_and_owner().await;
+        let org = OrganizationStore::find_by_slug(DB::Conn(&state.db), &org_slug)
+            .await
+            .expect("lookup org")
+            .expect("org exists");
+        let admin = UserStore::create(
+            DB::Conn(&state.db),
+            "domain-admin@example.test",
+            None,
+            false,
+        )
+        .await
+        .expect("create admin");
+        let custom = UserStore::create(
+            DB::Conn(&state.db),
+            "domain-custom@example.test",
+            None,
+            false,
+        )
+        .await
+        .expect("create custom manager");
+        let member = UserStore::create(
+            DB::Conn(&state.db),
+            "domain-member@example.test",
+            None,
+            false,
+        )
+        .await
+        .expect("create member");
+        let outsider = UserStore::create(
+            DB::Conn(&state.db),
+            "domain-outsider@example.test",
+            None,
+            false,
+        )
+        .await
+        .expect("create outsider");
+        MembershipStore::create(DB::Conn(&state.db), &org.id, &admin.id, "admin")
+            .await
+            .expect("add admin");
+        MembershipStore::create(DB::Conn(&state.db), &org.id, &member.id, "member")
+            .await
+            .expect("add member");
+        OrganizationRoleStore::create(
+            DB::Conn(&state.db),
+            "domain-manager-role",
+            &org.id,
+            "domain-manager",
+            "Domain Manager",
+            None,
+            serde_json::json!([CAP_INTEGRATIONS_MANAGE]),
+        )
+        .await
+        .expect("create domain manager role");
+        MembershipStore::create(DB::Conn(&state.db), &org.id, &custom.id, "domain-manager")
+            .await
+            .expect("add custom manager");
+
+        let auth_for = |user: &crate::entities::users::Model| -> AuthUser {
+            let token = state
+                .jwt_service
+                .create_token(&user.id, &user.email, false, Some(&org_slug), None)
+                .expect("create test token");
+            AuthUser {
+                claims: state
+                    .jwt_service
+                    .validate_token(&token)
+                    .expect("validate test token"),
+                user: user.clone(),
+                permissions: vec![],
+                ip_address: "127.0.0.1".to_string(),
+                user_agent: "domain-actor-test".to_string(),
+                current_session_id: None,
+            }
+        };
+        let admin_auth = auth_for(&admin);
+        let custom_auth = auth_for(&custom);
+        let member_auth = auth_for(&member);
+        let outsider_auth = auth_for(&outsider);
+
+        for auth in [owner.clone(), admin_auth.clone(), custom_auth.clone()] {
+            let Json(created) = create_domain_route(
+                State(state.clone()),
+                auth.clone(),
+                Path(org_slug.clone()),
+                Json(CreateDomainRouteRequest {
+                    domain: format!("actor-{}.example.test", uuid::Uuid::new_v4()),
+                    upstream_provider_id: None,
+                    login_policy: Some(DOMAIN_LOGIN_POLICY_PASSWORD_ALLOWED.to_string()),
+                }),
+            )
+            .await
+            .expect("integration manager may create a domain route");
+            let Json(list) =
+                list_domain_routes(State(state.clone()), auth.clone(), Path(org_slug.clone()))
+                    .await
+                    .expect("integration manager may list domain routes");
+            assert!(list.iter().any(|route| route.id == created.id));
+            let Json(updated) = update_domain_route(
+                State(state.clone()),
+                auth.clone(),
+                Path((org_slug.clone(), created.id.clone())),
+                Json(UpdateDomainRouteRequest {
+                    upstream_provider_id: None,
+                    login_policy: Some(DOMAIN_LOGIN_POLICY_UPSTREAM_ONLY.to_string()),
+                }),
+            )
+            .await
+            .expect("integration manager may update a domain route");
+            assert_eq!(updated.login_policy, DOMAIN_LOGIN_POLICY_UPSTREAM_ONLY);
+            let _ = delete_domain_route(
+                State(state.clone()),
+                auth,
+                Path((org_slug.clone(), created.id.clone())),
+            )
+            .await
+            .expect("integration manager may delete a domain route");
+        }
+
+        for auth in [member_auth.clone(), outsider_auth.clone()] {
+            assert!(matches!(
+                list_domain_routes(State(state.clone()), auth.clone(), Path(org_slug.clone()))
+                    .await,
+                Err(AppError::Forbidden(_))
+            ));
+            assert!(matches!(
+                create_domain_route(
+                    State(state.clone()),
+                    auth.clone(),
+                    Path(org_slug.clone()),
+                    Json(CreateDomainRouteRequest {
+                        domain: format!("denied-{}.example.test", uuid::Uuid::new_v4()),
+                        upstream_provider_id: None,
+                        login_policy: None,
+                    }),
+                )
+                .await,
+                Err(AppError::Forbidden(_))
+            ));
+        }
+
+        let Json(owner_route) = create_domain_route(
+            State(state.clone()),
+            owner.clone(),
+            Path(org_slug.clone()),
+            Json(CreateDomainRouteRequest {
+                domain: format!("owner-{}.example.test", uuid::Uuid::new_v4()),
+                upstream_provider_id: None,
+                login_policy: None,
+            }),
+        )
+        .await
+        .expect("owner may create a domain route");
+        for auth in [member_auth.clone(), outsider_auth.clone()] {
+            assert!(matches!(
+                update_domain_route(
+                    State(state.clone()),
+                    auth.clone(),
+                    Path((org_slug.clone(), owner_route.id.clone())),
+                    Json(UpdateDomainRouteRequest {
+                        upstream_provider_id: None,
+                        login_policy: Some(DOMAIN_LOGIN_POLICY_UPSTREAM_ONLY.to_string()),
+                    }),
+                )
+                .await,
+                Err(AppError::Forbidden(_))
+            ));
+            assert!(matches!(
+                delete_domain_route(
+                    State(state.clone()),
+                    auth,
+                    Path((org_slug.clone(), owner_route.id.clone())),
+                )
+                .await,
+                Err(AppError::Forbidden(_))
+            ));
+        }
     }
 }

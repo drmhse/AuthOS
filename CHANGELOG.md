@@ -5,6 +5,27 @@ project is pre-1.0; breaking changes are called out explicitly when known.
 
 ## [Unreleased]
 
+### Added
+
+- An independent security assessment scope for the `v0.9` candidate and a
+  90-day reference deployment evidence plan, so the two longest-lead `v1.0`
+  gates can start with concrete criteria.
+
+### Changed
+
+- `main` now requires the CI and Security checks, pull requests, and
+  conversation resolution; `v*` tags are protected from deletion and
+  non-fast-forward updates; and release publication pauses for approval in the
+  `release` environment.
+- A daily Restore qualification workflow runs SQLite, PostgreSQL 16, and MySQL
+  8.4 backup/restore journeys and retains each log for 90 days. The first
+  manually dispatched run succeeded for all three backends.
+- Tenant-isolation evidence now covers organization core read/update/delete/list
+  across owner, member, custom-role, admin, and non-member actors, and SCIM
+  token create/list/revoke/delete across cross-tenant, nonexistent-ID,
+  invalid-expiry, and suspended-parent cases. The tracked critical/high matrix
+  count is 27.
+
 ### Fixed
 
 - Release finalization now polls the npm registry for up to 15 minutes before

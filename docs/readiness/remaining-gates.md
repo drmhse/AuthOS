@@ -111,7 +111,8 @@ The local workspace cannot truthfully manufacture these results:
 - twenty consecutive protected security/quality runs with negative controls
   shown to block merge;
 - thirty consecutive scheduled restore results plus two measured recovery
-  drills for every deployment mode that receives an RPO/RTO claim;
+  drills for every deployment mode that receives an RPO/RTO claim; the daily
+  workflow is configured, but the consecutive-result window has not completed;
 - two consecutive production-candidate releases without undocumented repair;
 - two independently operated reference deployments for ninety days, including
   one non-SQLite deployment and one SAML or SCIM deployment, each completing an

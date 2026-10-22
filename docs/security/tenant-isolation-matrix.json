@@ -201,10 +201,17 @@
         "store::connected_accounts::tests::linked_account_ownership_and_provider_subject_collision_are_enforced",
         "store::service_provider_grants::tests::provider_grants_require_owned_matching_account_and_preserve_denied_state",
         "store::user_devices::tests::user_scoped_device_mutations_deny_other_user_and_preserve_state",
-        "store::user_passkeys::tests::passkey_management_denies_other_user_and_preserves_target"
+        "store::user_passkeys::tests::passkey_management_denies_other_user_and_preserves_target",
+        "handlers::privacy::privacy_route_tests::export_returns_the_requesters_own_data",
+        "handlers::privacy::privacy_route_tests::export_by_an_org_owner_covers_the_target_but_only_while_they_own_every_org",
+        "handlers::privacy::privacy_route_tests::tenant_owner_cannot_export_a_platform_owner_member",
+        "handlers::privacy::privacy_route_tests::forget_user_by_outsider_is_refused_and_preserves_target",
+        "handlers::privacy::privacy_route_tests::forget_user_by_owner_of_all_target_orgs_anonymizes",
+        "handlers::privacy::privacy_route_tests::forget_user_by_platform_owner_anonymizes",
+        "handlers::privacy::privacy_route_tests::forget_user_cross_tenant_owner_is_refused_and_preserves_target",
+        "handlers::identities::tests::identity_management_is_scoped_to_the_authenticated_user"
       ],
       "open_gaps": [
-        "critical: privacy user_id and identity cross-user handler matrix",
         "high: shared-user multi-organization context tests",
         "high: PostgreSQL and MySQL parity"
       ]

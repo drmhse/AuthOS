@@ -27,11 +27,11 @@ project is pre-1.0; breaking changes are called out explicitly when known.
   8.4 backup/restore journeys and retains each log for 90 days. The first
   manually dispatched run succeeded for all three backends.
 - Tenant-isolation evidence now covers organization core read/update/delete/list
-  member list/role/removal/service-access, and invitation management routes
-  across owner, member, custom-role, admin, and non-member actors, plus SCIM
-  token create/list/revoke/delete across cross-tenant, nonexistent-ID,
-  invalid-expiry, and suspended-parent cases. The tracked critical/high matrix
-  count is 26.
+  member list/role/removal/service-access, invitation management, and privacy
+  export/anonymization routes across owner, member, custom-role, admin, and
+  non-member actors, plus SCIM token create/list/revoke/delete across
+  cross-tenant, nonexistent-ID, invalid-expiry, and suspended-parent cases.
+  The tracked critical/high matrix count is 25.
 
 ### Fixed
 

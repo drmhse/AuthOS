@@ -850,3 +850,431 @@ mod secret_tests {
         assert!(!serialized.contains("encrypted-auth-header-canary"));
     }
 }
+
+#[cfg(test)]
+mod route_tests {
+    use super::*;
+
+    use crate::audit::actor::AuditHandle;
+    use crate::billing::providers::disabled::DisabledBillingProvider;
+    use crate::crypto::sso::OAuthClient;
+    use crate::entities::users;
+    use crate::services::{
+        events::EventDispatcher, metrics::MfaMetricsService, risk_engine::RiskEngine,
+    };
+    use crate::store::{
+        memberships::MembershipStore,
+        organization_roles::OrganizationRoleStore,
+        users::{UserCreationOptions, UserStore},
+    };
+    use crate::test_support::{setup_db, test_config, test_jwt_service};
+    use moka::future::Cache;
+    use std::sync::Arc;
+
+    struct Fixture {
+        state: AppState,
+        owner: AuthUser,
+        admin: AuthUser,
+        custom_manager: AuthUser,
+        member: AuthUser,
+        outsider: AuthUser,
+        other_owner: AuthUser,
+        alpha_slug: String,
+        alpha_config_id: String,
+        beta_config_id: String,
+    }
+
+    async fn seed_config(db: &sea_orm::DatabaseConnection, org_id: &str, name: &str) -> String {
+        SiemConfigStore::create(
+            DB::Conn(db),
+            &uuid::Uuid::new_v4().to_string(),
+            org_id,
+            name,
+            "Custom",
+            "https://siem.example.test/events",
+            None,
+            None,
+            Some(50),
+        )
+        .await
+        .expect("seed SIEM config")
+    }
+
+    async fn fixture() -> Fixture {
+        let db = setup_db().await;
+        let config = test_config();
+        let jwt_service = Arc::new(test_jwt_service(&config));
+
+        let owner = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "siem-route-owner@example.test",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create owner")
+        .0;
+        let admin = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "siem-route-admin@example.test",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create admin")
+        .0;
+        let custom_manager = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "siem-route-custom@example.test",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create custom manager")
+        .0;
+        let member = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "siem-route-member@example.test",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create member")
+        .0;
+        let outsider = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "siem-route-outsider@example.test",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create outsider")
+        .0;
+        let other_owner = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "siem-route-other-owner@example.test",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create other owner")
+        .0;
+
+        let (alpha, _) = OrganizationStore::create_with_owner(
+            DB::Conn(&db),
+            "siem-route-alpha",
+            "SIEM Route Alpha",
+            &owner.id,
+            Some("tier_enterprise"),
+        )
+        .await
+        .expect("create alpha");
+        let (beta, _) = OrganizationStore::create_with_owner(
+            DB::Conn(&db),
+            "siem-route-beta",
+            "SIEM Route Beta",
+            &other_owner.id,
+            Some("tier_enterprise"),
+        )
+        .await
+        .expect("create beta");
+        for org in [&alpha, &beta] {
+            OrganizationStore::update_status(DB::Conn(&db), &org.id, "active")
+                .await
+                .expect("activate organization");
+        }
+
+        MembershipStore::create(DB::Conn(&db), &alpha.id, &admin.id, "admin")
+            .await
+            .expect("add admin");
+        MembershipStore::create(DB::Conn(&db), &alpha.id, &member.id, "member")
+            .await
+            .expect("add member");
+        OrganizationRoleStore::create(
+            DB::Conn(&db),
+            "siem-route-manager-role",
+            &alpha.id,
+            "siem-route-manager",
+            "SIEM Route Manager",
+            None,
+            serde_json::json!([CAP_INTEGRATIONS_MANAGE]),
+        )
+        .await
+        .expect("create SIEM manager role");
+        MembershipStore::create(
+            DB::Conn(&db),
+            &alpha.id,
+            &custom_manager.id,
+            "siem-route-manager",
+        )
+        .await
+        .expect("add custom manager");
+
+        let alpha_config_id = seed_config(&db, &alpha.id, "Alpha SIEM").await;
+        let beta_config_id = seed_config(&db, &beta.id, "Beta SIEM").await;
+
+        let state = AppState {
+            db: db.clone(),
+            #[cfg(feature = "db_sqlite")]
+            db_writer: db.clone(),
+            oauth_client: Arc::new(OAuthClient::new(&config).expect("create oauth client")),
+            jwt_service: jwt_service.clone(),
+            base_url: config.base_url.clone(),
+            web_client_url: config.platform_dashboard_base_url.clone(),
+            full_web_client_url: config.full_web_client_base_url.clone(),
+            encryption: None,
+            email_service: None,
+            metrics_service: Arc::new(MfaMetricsService::new(db.clone())),
+            event_dispatcher: Arc::new(EventDispatcher::new(db.clone())),
+            billing_provider: Arc::new(DisabledBillingProvider::new()),
+            risk_engine: Arc::new(RiskEngine::new().expect("create risk engine")),
+            webauthn_service: None,
+            permission_cache: Cache::new(10_000),
+            user_cache: Cache::new(10_000),
+            domain_cache: Cache::new(10_000),
+            audit_actor: AuditHandle::new(db.clone()),
+            config,
+        };
+
+        let auth_user_for = |user: &users::Model| -> AuthUser {
+            let token = state
+                .jwt_service
+                .create_token(&user.id, &user.email, false, None, None)
+                .expect("create test token");
+            AuthUser {
+                claims: state
+                    .jwt_service
+                    .validate_token(&token)
+                    .expect("validate test token"),
+                user: user.clone(),
+                permissions: vec![],
+                ip_address: "127.0.0.1".to_string(),
+                user_agent: "siem-route-test".to_string(),
+                current_session_id: None,
+            }
+        };
+        let owner_auth = auth_user_for(&owner);
+        let admin_auth = auth_user_for(&admin);
+        let custom_auth = auth_user_for(&custom_manager);
+        let member_auth = auth_user_for(&member);
+        let outsider_auth = auth_user_for(&outsider);
+        let other_owner_auth = auth_user_for(&other_owner);
+
+        Fixture {
+            state,
+            owner: owner_auth,
+            admin: admin_auth,
+            custom_manager: custom_auth,
+            member: member_auth,
+            outsider: outsider_auth,
+            other_owner: other_owner_auth,
+            alpha_slug: alpha.slug,
+            alpha_config_id,
+            beta_config_id,
+        }
+    }
+
+    #[tokio::test]
+    async fn siem_routes_require_live_integration_authority_and_are_org_scoped() {
+        let f = fixture().await;
+
+        for auth in [f.owner.clone(), f.admin.clone(), f.custom_manager.clone()] {
+            let Json(list) = list_siem_configs(
+                State(f.state.clone()),
+                Path(f.alpha_slug.clone()),
+                axum::Extension(auth.clone()),
+            )
+            .await
+            .expect("integration manager may list SIEM configs");
+            assert!(list
+                .siem_configs
+                .iter()
+                .any(|config| config.id == f.alpha_config_id));
+            assert!(!list
+                .siem_configs
+                .iter()
+                .any(|config| config.id == f.beta_config_id));
+
+            let Json(config) = get_siem_config(
+                State(f.state.clone()),
+                Path((f.alpha_slug.clone(), f.alpha_config_id.clone())),
+                axum::Extension(auth.clone()),
+            )
+            .await
+            .expect("integration manager may read SIEM config");
+            assert_eq!(config.id, f.alpha_config_id);
+
+            let Json(updated) = update_siem_config(
+                State(f.state.clone()),
+                Path((f.alpha_slug.clone(), f.alpha_config_id.clone())),
+                axum::Extension(auth.clone()),
+                Json(UpdateSiemConfigRequest {
+                    name: Some("Renamed SIEM".to_string()),
+                    endpoint_url: None,
+                    api_key: None,
+                    auth_header: None,
+                    batch_size: None,
+                    enabled: Some(true),
+                }),
+            )
+            .await
+            .expect("integration manager may update SIEM config");
+            assert_eq!(updated.name, "Renamed SIEM");
+
+            let Json(test_result) = test_siem_connection(
+                State(f.state.clone()),
+                Path((f.alpha_slug.clone(), f.alpha_config_id.clone())),
+                axum::Extension(auth),
+            )
+            .await
+            .expect("integration manager may test SIEM connection");
+            assert!(!test_result.success);
+        }
+
+        for auth in [f.member.clone(), f.outsider.clone(), f.other_owner.clone()] {
+            assert!(matches!(
+                list_siem_configs(
+                    State(f.state.clone()),
+                    Path(f.alpha_slug.clone()),
+                    axum::Extension(auth.clone()),
+                )
+                .await,
+                Err(AppError::Forbidden(_))
+            ));
+            assert!(matches!(
+                get_siem_config(
+                    State(f.state.clone()),
+                    Path((f.alpha_slug.clone(), f.alpha_config_id.clone())),
+                    axum::Extension(auth.clone()),
+                )
+                .await,
+                Err(AppError::Forbidden(_))
+            ));
+            assert!(matches!(
+                update_siem_config(
+                    State(f.state.clone()),
+                    Path((f.alpha_slug.clone(), f.alpha_config_id.clone())),
+                    axum::Extension(auth.clone()),
+                    Json(UpdateSiemConfigRequest {
+                        name: Some("Denied".to_string()),
+                        endpoint_url: None,
+                        api_key: None,
+                        auth_header: None,
+                        batch_size: None,
+                        enabled: Some(true),
+                    }),
+                )
+                .await,
+                Err(AppError::Forbidden(_))
+            ));
+            assert!(matches!(
+                delete_siem_config(
+                    State(f.state.clone()),
+                    Path((f.alpha_slug.clone(), f.alpha_config_id.clone())),
+                    axum::Extension(auth.clone()),
+                )
+                .await,
+                Err(AppError::Forbidden(_))
+            ));
+            assert!(matches!(
+                test_siem_connection(
+                    State(f.state.clone()),
+                    Path((f.alpha_slug.clone(), f.alpha_config_id.clone())),
+                    axum::Extension(auth),
+                )
+                .await,
+                Err(AppError::Forbidden(_))
+            ));
+        }
+
+        // Cross-tenant IDs are hidden and leave the beta config unchanged.
+        for operation in ["get", "update", "delete", "test"] {
+            let result = match operation {
+                "get" => get_siem_config(
+                    State(f.state.clone()),
+                    Path((f.alpha_slug.clone(), f.beta_config_id.clone())),
+                    axum::Extension(f.owner.clone()),
+                )
+                .await
+                .map(|_| ())
+                .err(),
+                "update" => update_siem_config(
+                    State(f.state.clone()),
+                    Path((f.alpha_slug.clone(), f.beta_config_id.clone())),
+                    axum::Extension(f.owner.clone()),
+                    Json(UpdateSiemConfigRequest {
+                        name: Some("Cross Tenant".to_string()),
+                        endpoint_url: None,
+                        api_key: None,
+                        auth_header: None,
+                        batch_size: None,
+                        enabled: Some(true),
+                    }),
+                )
+                .await
+                .map(|_| ())
+                .err(),
+                "delete" => delete_siem_config(
+                    State(f.state.clone()),
+                    Path((f.alpha_slug.clone(), f.beta_config_id.clone())),
+                    axum::Extension(f.owner.clone()),
+                )
+                .await
+                .map(|_| ())
+                .err(),
+                _ => test_siem_connection(
+                    State(f.state.clone()),
+                    Path((f.alpha_slug.clone(), f.beta_config_id.clone())),
+                    axum::Extension(f.owner.clone()),
+                )
+                .await
+                .map(|_| ())
+                .err(),
+            };
+            assert!(
+                matches!(result, Some(AppError::NotFound(_))),
+                "expected not found for cross-tenant SIEM {operation}, got {result:?}"
+            );
+        }
+        assert!(
+            SiemConfigStore::get_by_id(DB::Conn(&f.state.db), &f.beta_config_id)
+                .await
+                .expect("load beta config")
+                .is_some(),
+            "cross-tenant operations must preserve the beta config"
+        );
+
+        // The owner can delete the alpha config; beta remains.
+        let _ = delete_siem_config(
+            State(f.state.clone()),
+            Path((f.alpha_slug.clone(), f.alpha_config_id.clone())),
+            axum::Extension(f.owner.clone()),
+        )
+        .await
+        .expect("owner may delete SIEM config");
+        assert!(
+            SiemConfigStore::get_by_id(DB::Conn(&f.state.db), &f.alpha_config_id)
+                .await
+                .expect("load deleted config")
+                .is_none()
+        );
+        assert!(
+            SiemConfigStore::get_by_id(DB::Conn(&f.state.db), &f.beta_config_id)
+                .await
+                .expect("load beta config")
+                .is_some()
+        );
+    }
+}

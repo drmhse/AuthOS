@@ -141,10 +141,17 @@
         "handlers::siem_configs::secret_tests::siem_test_credentials_are_provider_specific_and_fail_closed",
         "handlers::siem_configs::secret_tests::siem_api_response_never_serializes_credential_columns",
         "handlers::organizations::domain_routing::tests::domain_route_mutations_reject_cross_org_id_and_preserve_target",
-        "handlers::organizations::domain_routing::tests::domain_route_mutations_reject_suspended_parent_and_preserve_state"
+        "handlers::organizations::domain_routing::tests::domain_route_mutations_reject_suspended_parent_and_preserve_state",
+        "handlers::organizations::domain_routing::tests::domain_route_actor_matrix_requires_live_integration_authority",
+        "handlers::organizations::settings::route_tests::oauth_credential_routes_require_settings_authority_and_are_org_scoped",
+        "handlers::organizations::upstream_providers::route_tests::upstream_provider_routes_require_live_integration_authority_and_are_org_scoped",
+        "handlers::siem_configs::route_tests::siem_routes_require_live_integration_authority_and_are_org_scoped",
+        "handlers::webhooks::tests::create_webhook_denies_plain_members",
+        "handlers::webhooks::tests::list_get_update_and_delete_round_trip",
+        "handlers::webhooks::tests::deliveries_list_and_test_ping_work_together",
+        "handlers::webhooks::tests::event_types_are_listed_but_members_are_denied"
       ],
       "open_gaps": [
-        "critical: handler tests for OAuth credential and upstream-provider IDs plus SIEM actor/test-action and webhook delivery-history/test-action cases; complete domain actor cases",
         "high: remaining secret rotation and background delivery concurrency/multi-replica cases",
         "high: PostgreSQL and MySQL parity"
       ]

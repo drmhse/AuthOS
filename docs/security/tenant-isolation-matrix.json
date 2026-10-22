@@ -33,6 +33,9 @@
         "handlers::organizations::members::route_tests::member_listing_and_service_access_are_org_scoped",
         "handlers::organizations::members::route_tests::member_role_updates_require_role_management_and_preserve_denied_targets",
         "handlers::organizations::members::route_tests::member_removal_requires_manage_authority_and_preserves_denied_targets",
+        "handlers::invitations::route_tests::invitation_management_requires_member_authority_and_is_org_scoped",
+        "handlers::invitations::route_tests::invitation_acceptance_by_id_is_email_and_org_bound",
+        "handlers::invitations::route_tests::suspended_parent_denies_invitation_management_and_acceptance",
         "handlers::organizations::members::tests::ownership_transfer_binds_same_email_to_selected_org_member",
         "handlers::organizations::members::tests::concurrent_ownership_transfers_have_one_winner_and_one_owner_membership",
         "handlers::invitations::tests::invitation_acceptance_ignores_platform_and_sibling_same_email_users",
@@ -40,7 +43,6 @@
         "handlers::invitations::tests::suspended_parent_rejects_invitation_acceptance_without_state_changes"
       ],
       "open_gaps": [
-        "critical: complete invitation child-ID route tests for owner/admin/custom-role/member/non-member with cross-org IDs and unchanged denied state",
         "high: pending/deleted-parent and distributed cache-revocation timing, plus suspended-parent cases beyond organization selection",
         "high: PostgreSQL and MySQL parity"
       ]

@@ -456,9 +456,11 @@ async fn accept_invitation_internal(
 
                 if let Some(expected_org_id) = expected_org_id.as_ref() {
                     if invitation.org_id != *expected_org_id {
-                        return Err(AppError::Forbidden(
-                            "This invitation does not belong to the specified organization"
-                                .to_string(),
+                        // A manager scoped to one organization must not be able
+                        // to distinguish a real invitation in another tenant
+                        // from a nonexistent invitation ID.
+                        return Err(AppError::NotFound(
+                            "Invitation not found or already processed".to_string(),
                         ));
                     }
                 }
@@ -1240,6 +1242,641 @@ mod tests {
                 .await
                 .expect("count tenant identities"),
             1
+        );
+    }
+}
+
+#[cfg(test)]
+mod route_tests {
+    use super::*;
+
+    use crate::audit::actor::AuditHandle;
+    use crate::billing::providers::disabled::DisabledBillingProvider;
+    use crate::crypto::sso::OAuthClient;
+    use crate::entities::prelude::OrganizationInvitations;
+    use crate::services::{
+        events::EventDispatcher, metrics::MfaMetricsService, risk_engine::RiskEngine,
+    };
+    use crate::store::users::{UserCreationOptions, UserStore};
+    use crate::test_support::{setup_db, test_config, test_jwt_service};
+    use moka::future::Cache;
+    use sea_orm::{DatabaseConnection, EntityTrait};
+    use serde_json::json;
+    use std::sync::Arc;
+
+    struct Fixture {
+        state: AppState,
+        owner: AuthUser,
+        admin: AuthUser,
+        member: AuthUser,
+        custom_manager: AuthUser,
+        outsider: AuthUser,
+        other_owner: AuthUser,
+        alpha_invitee: AuthUser,
+        beta_invitee: AuthUser,
+        alpha_slug: String,
+        alpha_invitation_id: String,
+        beta_invitation_id: String,
+        alpha_invitation_token: String,
+        beta_invitation_id_for_admin: String,
+    }
+
+    async fn seed_invitation(
+        db: &DatabaseConnection,
+        org_id: &str,
+        invited_by: &str,
+        email: &str,
+        role: &str,
+        token: &str,
+    ) -> organization_invitations::Model {
+        organization_invitations::ActiveModel {
+            id: Set(Uuid::new_v4().to_string()),
+            org_id: Set(org_id.to_string()),
+            email: Set(email.to_string()),
+            role: Set(role.to_string()),
+            invited_by: Set(invited_by.to_string()),
+            status: Set("pending".to_string()),
+            token: Set(hash_invitation_token(token)),
+            expires_at: Set((Utc::now() + ChronoDuration::days(1)).naive_utc()),
+            created_at: Set(Utc::now().naive_utc()),
+        }
+        .insert(db)
+        .await
+        .expect("seed invitation")
+    }
+
+    async fn fixture() -> Fixture {
+        let db = setup_db().await;
+        let config = test_config();
+        let jwt_service = Arc::new(test_jwt_service(&config));
+
+        let owner = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "invite-owner@example.test",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create owner")
+        .0;
+        let admin = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "invite-admin@example.test",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create admin")
+        .0;
+        let member = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "invite-member@example.test",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create member")
+        .0;
+        let custom_manager = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "invite-custom@example.test",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create custom manager")
+        .0;
+        let outsider = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "invite-outsider@example.test",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create outsider")
+        .0;
+        let other_owner = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "invite-other-owner@example.test",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create other owner")
+        .0;
+        let alpha_invitee = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "alpha-invitee@example.test",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create alpha invitee")
+        .0;
+        let beta_invitee = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "beta-invitee@example.test",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create beta invitee")
+        .0;
+
+        let (alpha, _) = OrganizationStore::create_with_owner(
+            DB::Conn(&db),
+            "invite-alpha",
+            "Invite Alpha",
+            &owner.id,
+            Some("tier_enterprise"),
+        )
+        .await
+        .expect("create alpha");
+        let (beta, _) = OrganizationStore::create_with_owner(
+            DB::Conn(&db),
+            "invite-beta",
+            "Invite Beta",
+            &other_owner.id,
+            Some("tier_enterprise"),
+        )
+        .await
+        .expect("create beta");
+        for org in [&alpha, &beta] {
+            OrganizationStore::update_status(DB::Conn(&db), &org.id, "active")
+                .await
+                .expect("activate organization");
+        }
+
+        MembershipStore::create(DB::Conn(&db), &alpha.id, &admin.id, "admin")
+            .await
+            .expect("add admin");
+        MembershipStore::create(DB::Conn(&db), &alpha.id, &member.id, "member")
+            .await
+            .expect("add member");
+        OrganizationRoleStore::create(
+            DB::Conn(&db),
+            "invite-manager-role",
+            &alpha.id,
+            "invite-manager",
+            "Invite Manager",
+            None,
+            json!([CAP_ORG_MEMBERS_MANAGE, CAP_ORG_ROLES_MANAGE]),
+        )
+        .await
+        .expect("create invite-manager role");
+        MembershipStore::create(
+            DB::Conn(&db),
+            &alpha.id,
+            &custom_manager.id,
+            "invite-manager",
+        )
+        .await
+        .expect("add custom manager");
+
+        let alpha_invitation = seed_invitation(
+            &db,
+            &alpha.id,
+            &owner.id,
+            &alpha_invitee.email,
+            "member",
+            "alpha-invitation-token",
+        )
+        .await;
+        let beta_invitation = seed_invitation(
+            &db,
+            &beta.id,
+            &other_owner.id,
+            &beta_invitee.email,
+            "member",
+            "beta-invitation-token",
+        )
+        .await;
+        let admin_accept_invitation = seed_invitation(
+            &db,
+            &alpha.id,
+            &owner.id,
+            "admin-accept@example.test",
+            "member",
+            "admin-accept-token",
+        )
+        .await;
+
+        let state = AppState {
+            db: db.clone(),
+            #[cfg(feature = "db_sqlite")]
+            db_writer: db.clone(),
+            oauth_client: Arc::new(OAuthClient::new(&config).expect("create oauth client")),
+            jwt_service: jwt_service.clone(),
+            base_url: config.base_url.clone(),
+            web_client_url: config.platform_dashboard_base_url.clone(),
+            full_web_client_url: config.full_web_client_base_url.clone(),
+            encryption: None,
+            email_service: None,
+            metrics_service: Arc::new(MfaMetricsService::new(db.clone())),
+            event_dispatcher: Arc::new(EventDispatcher::new(db.clone())),
+            billing_provider: Arc::new(DisabledBillingProvider::new()),
+            risk_engine: Arc::new(RiskEngine::new().expect("create risk engine")),
+            webauthn_service: None,
+            permission_cache: Cache::new(10_000),
+            user_cache: Cache::new(10_000),
+            domain_cache: Cache::new(10_000),
+            audit_actor: AuditHandle::new(db.clone()),
+            config,
+        };
+
+        let auth_user_for = |user: &users::Model| -> AuthUser {
+            let token = state
+                .jwt_service
+                .create_token(&user.id, &user.email, false, None, None)
+                .expect("create test token");
+            AuthUser {
+                claims: state
+                    .jwt_service
+                    .validate_token(&token)
+                    .expect("validate test token"),
+                user: user.clone(),
+                permissions: vec![],
+                ip_address: "127.0.0.1".to_string(),
+                user_agent: "invitation-route-test".to_string(),
+                current_session_id: None,
+            }
+        };
+        let owner_auth = auth_user_for(&owner);
+        let admin_auth = auth_user_for(&admin);
+        let member_auth = auth_user_for(&member);
+        let custom_auth = auth_user_for(&custom_manager);
+        let outsider_auth = auth_user_for(&outsider);
+        let other_owner_auth = auth_user_for(&other_owner);
+        let alpha_invitee_auth = auth_user_for(&alpha_invitee);
+        let beta_invitee_auth = auth_user_for(&beta_invitee);
+
+        Fixture {
+            state,
+            owner: owner_auth,
+            admin: admin_auth,
+            member: member_auth,
+            custom_manager: custom_auth,
+            outsider: outsider_auth,
+            other_owner: other_owner_auth,
+            alpha_invitee: alpha_invitee_auth,
+            beta_invitee: beta_invitee_auth,
+            alpha_slug: alpha.slug,
+            alpha_invitation_id: alpha_invitation.id,
+            beta_invitation_id: beta_invitation.id,
+            alpha_invitation_token: "alpha-invitation-token".to_string(),
+            beta_invitation_id_for_admin: admin_accept_invitation.id,
+        }
+    }
+
+    async fn invitation_ids(
+        state: &AppState,
+        auth: AuthUser,
+        org_slug: &str,
+    ) -> Result<Vec<String>> {
+        let Json(rows) = list_invitations(
+            State(state.clone()),
+            auth,
+            Path(org_slug.to_string()),
+            Query(ListInvitationsQuery {
+                page: None,
+                limit: None,
+                status: None,
+            }),
+        )
+        .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| {
+                row.get("invitation")
+                    .and_then(|invitation| invitation.get("id"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect())
+    }
+
+    #[tokio::test]
+    async fn invitation_management_requires_member_authority_and_is_org_scoped() {
+        let f = fixture().await;
+
+        for auth in [f.owner.clone(), f.admin.clone(), f.custom_manager.clone()] {
+            let ids = invitation_ids(&f.state, auth, &f.alpha_slug)
+                .await
+                .expect("member manager may list invitations");
+            assert!(ids.contains(&f.alpha_invitation_id));
+            assert!(!ids.contains(&f.beta_invitation_id));
+        }
+        for auth in [f.member.clone(), f.outsider.clone(), f.other_owner.clone()] {
+            assert!(matches!(
+                invitation_ids(&f.state, auth, &f.alpha_slug).await,
+                Err(AppError::Forbidden(_))
+            ));
+        }
+
+        for auth in [f.member.clone(), f.outsider.clone(), f.other_owner.clone()] {
+            assert!(matches!(
+                create_invitation(
+                    State(f.state.clone()),
+                    auth,
+                    Path(f.alpha_slug.clone()),
+                    Json(CreateInvitationRequest {
+                        email: "denied-invite@example.test".to_string(),
+                        role: "member".to_string(),
+                    }),
+                )
+                .await,
+                Err(AppError::Forbidden(_))
+            ));
+        }
+
+        // A custom member manager may invite members but cannot mint admins.
+        let Json(member_invite) = create_invitation(
+            State(f.state.clone()),
+            f.custom_manager.clone(),
+            Path(f.alpha_slug.clone()),
+            Json(CreateInvitationRequest {
+                email: "custom-invite@example.test".to_string(),
+                role: "member".to_string(),
+            }),
+        )
+        .await
+        .expect("custom manager may invite a member");
+        assert_eq!(member_invite.invitation.email, "custom-invite@example.test");
+        assert_eq!(member_invite.invitation.role, "member");
+        assert!(matches!(
+            create_invitation(
+                State(f.state.clone()),
+                f.custom_manager.clone(),
+                Path(f.alpha_slug.clone()),
+                Json(CreateInvitationRequest {
+                    email: "custom-admin-invite@example.test".to_string(),
+                    role: "admin".to_string(),
+                }),
+            )
+            .await,
+            Err(AppError::Forbidden(_))
+        ));
+
+        // Only the owner can invite an admin.
+        let Json(admin_invite) = create_invitation(
+            State(f.state.clone()),
+            f.owner.clone(),
+            Path(f.alpha_slug.clone()),
+            Json(CreateInvitationRequest {
+                email: "owner-admin-invite@example.test".to_string(),
+                role: "admin".to_string(),
+            }),
+        )
+        .await
+        .expect("owner may invite an admin");
+        assert_eq!(admin_invite.invitation.role, "admin");
+
+        // Denied cancellation leaves the pending invitation intact.
+        for auth in [f.member.clone(), f.outsider.clone()] {
+            assert!(matches!(
+                cancel_invitation(
+                    State(f.state.clone()),
+                    auth,
+                    Path((f.alpha_slug.clone(), f.alpha_invitation_id.clone())),
+                )
+                .await,
+                Err(AppError::Forbidden(_))
+            ));
+        }
+        // A cross-tenant invitation ID is hidden from the selected organization.
+        assert!(matches!(
+            cancel_invitation(
+                State(f.state.clone()),
+                f.owner.clone(),
+                Path((f.alpha_slug.clone(), f.beta_invitation_id.clone())),
+            )
+            .await,
+            Err(AppError::NotFound(_))
+        ));
+        let beta_stored = OrganizationInvitations::find_by_id(f.beta_invitation_id.clone())
+            .one(&f.state.db)
+            .await
+            .expect("load beta invitation")
+            .expect("beta invitation remains");
+        assert_eq!(beta_stored.status, "pending");
+
+        let _ = cancel_invitation(
+            State(f.state.clone()),
+            f.owner.clone(),
+            Path((f.alpha_slug.clone(), f.alpha_invitation_id.clone())),
+        )
+        .await
+        .expect("owner may cancel");
+        let alpha_stored = OrganizationInvitations::find_by_id(f.alpha_invitation_id.clone())
+            .one(&f.state.db)
+            .await
+            .expect("load alpha invitation")
+            .expect("alpha invitation remains");
+        assert_eq!(alpha_stored.status, "cancelled");
+    }
+
+    #[tokio::test]
+    async fn invitation_acceptance_by_id_is_email_and_org_bound() {
+        let f = fixture().await;
+        let alpha = OrganizationStore::find_by_slug(DB::Conn(&f.state.db), &f.alpha_slug)
+            .await
+            .expect("load alpha")
+            .expect("alpha exists");
+
+        // A different authenticated email cannot accept or decline the invite.
+        for auth in [f.outsider.clone(), f.other_owner.clone()] {
+            assert!(matches!(
+                accept_invitation_by_id(
+                    State(f.state.clone()),
+                    auth,
+                    Path(f.alpha_invitation_id.clone()),
+                )
+                .await,
+                Err(AppError::Forbidden(_))
+            ));
+        }
+        assert!(matches!(
+            decline_invitation_by_id(
+                State(f.state.clone()),
+                f.outsider.clone(),
+                Path(f.alpha_invitation_id.clone()),
+            )
+            .await,
+            Err(AppError::Forbidden(_))
+        ));
+        assert_eq!(
+            OrganizationInvitations::find_by_id(f.alpha_invitation_id.clone())
+                .one(&f.state.db)
+                .await
+                .expect("load alpha invitation")
+                .expect("alpha invitation remains")
+                .status,
+            "pending"
+        );
+
+        // The matching invitee can accept by token.
+        let _ = accept_invitation(
+            State(f.state.clone()),
+            f.alpha_invitee.clone(),
+            Json(UpdateInvitationRequest {
+                token: f.alpha_invitation_token.clone(),
+            }),
+        )
+        .await
+        .expect("matching invitee may accept by token");
+        let alpha_user = UserStore::find_by_email_with_context(
+            DB::Conn(&f.state.db),
+            "alpha-invitee@example.test",
+            Some(&alpha.id),
+        )
+        .await
+        .expect("load accepted user")
+        .expect("accepted user exists");
+        assert!(MembershipStore::find_by_org_and_user(
+            DB::Conn(&f.state.db),
+            &alpha.id,
+            &alpha_user.id,
+        )
+        .await
+        .expect("load accepted membership")
+        .is_some());
+
+        // A member manager can accept a different pending invitation by ID.
+        for auth in [f.member.clone(), f.outsider.clone()] {
+            assert!(matches!(
+                accept_invitation_as_admin(
+                    State(f.state.clone()),
+                    auth,
+                    Path((f.alpha_slug.clone(), f.beta_invitation_id_for_admin.clone())),
+                )
+                .await,
+                Err(AppError::Forbidden(_))
+            ));
+        }
+        let _ = accept_invitation_as_admin(
+            State(f.state.clone()),
+            f.custom_manager.clone(),
+            Path((f.alpha_slug.clone(), f.beta_invitation_id_for_admin.clone())),
+        )
+        .await
+        .expect("member manager may accept an invitation");
+        let admin_accept_user = UserStore::find_by_email_with_context(
+            DB::Conn(&f.state.db),
+            "admin-accept@example.test",
+            Some(&alpha.id),
+        )
+        .await
+        .expect("load admin-accepted user")
+        .expect("admin-accepted user exists");
+        assert!(MembershipStore::find_by_org_and_user(
+            DB::Conn(&f.state.db),
+            &alpha.id,
+            &admin_accept_user.id,
+        )
+        .await
+        .expect("load admin-accepted membership")
+        .is_some());
+
+        // A cross-tenant invitation ID cannot be accepted through alpha.
+        assert!(matches!(
+            accept_invitation_as_admin(
+                State(f.state.clone()),
+                f.owner.clone(),
+                Path((f.alpha_slug.clone(), f.beta_invitation_id.clone())),
+            )
+            .await,
+            Err(AppError::NotFound(_))
+        ));
+        assert_eq!(
+            OrganizationInvitations::find_by_id(f.beta_invitation_id.clone())
+                .one(&f.state.db)
+                .await
+                .expect("load beta invitation")
+                .expect("beta invitation remains")
+                .status,
+            "pending"
+        );
+
+        // The beta invitee can accept their own invitation by ID.
+        let _ = accept_invitation_by_id(
+            State(f.state.clone()),
+            f.beta_invitee.clone(),
+            Path(f.beta_invitation_id.clone()),
+        )
+        .await
+        .expect("beta invitee may accept");
+    }
+
+    #[tokio::test]
+    async fn suspended_parent_denies_invitation_management_and_acceptance() {
+        let f = fixture().await;
+        let alpha = OrganizationStore::find_by_slug(DB::Conn(&f.state.db), &f.alpha_slug)
+            .await
+            .expect("load alpha")
+            .expect("alpha exists");
+        OrganizationStore::update_status(DB::Conn(&f.state.db), &alpha.id, "suspended")
+            .await
+            .expect("suspend alpha");
+
+        assert!(matches!(
+            invitation_ids(&f.state, f.owner.clone(), &f.alpha_slug).await,
+            Err(AppError::Forbidden(_))
+        ));
+        assert!(matches!(
+            create_invitation(
+                State(f.state.clone()),
+                f.owner.clone(),
+                Path(f.alpha_slug.clone()),
+                Json(CreateInvitationRequest {
+                    email: "suspended-new@example.test".to_string(),
+                    role: "member".to_string(),
+                }),
+            )
+            .await,
+            Err(AppError::Forbidden(_))
+        ));
+        assert!(matches!(
+            cancel_invitation(
+                State(f.state.clone()),
+                f.owner.clone(),
+                Path((f.alpha_slug.clone(), f.alpha_invitation_id.clone())),
+            )
+            .await,
+            Err(AppError::Forbidden(_))
+        ));
+        assert!(matches!(
+            accept_invitation_by_id(
+                State(f.state.clone()),
+                f.alpha_invitee.clone(),
+                Path(f.alpha_invitation_id.clone()),
+            )
+            .await,
+            Err(AppError::Forbidden(_))
+        ));
+        assert_eq!(
+            OrganizationInvitations::find_by_id(f.alpha_invitation_id.clone())
+                .one(&f.state.db)
+                .await
+                .expect("load alpha invitation")
+                .expect("alpha invitation remains")
+                .status,
+            "pending"
         );
     }
 }

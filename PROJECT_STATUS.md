@@ -48,7 +48,8 @@ The labels used here mean:
 The canonical Phase 2 gap and evidence tracker is
 [docs/readiness/phase-2-evidence.md](./docs/readiness/phase-2-evidence.md).
 This table states current support; it does not duplicate that implementation
-backlog. The separate
+backlog. The [current readiness snapshot](./docs/readiness/current-status.md)
+summarizes the latest local evidence and remaining external gates. The separate
 [remaining-gates classification](./docs/readiness/remaining-gates.md) shows
 which open items are local engineering, release-candidate/infrastructure,
 administrative, independent, or time-based work.

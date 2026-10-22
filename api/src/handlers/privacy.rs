@@ -906,6 +906,115 @@ mod privacy_route_tests {
     }
 
     #[tokio::test]
+    async fn forget_user_by_outsider_is_refused_and_preserves_target() {
+        let f = fixture().await;
+        match forget_user(
+            State(f.state.clone()),
+            f.outsider.clone(),
+            Path(f.plain_id.clone()),
+            None,
+        )
+        .await
+        {
+            Err(AppError::Forbidden(_)) => {}
+            other => panic!("expected outsider forget refusal, got {other:?}"),
+        }
+        let unchanged = UserStore::find_by_id(DB::Conn(&f.state.db), &f.plain_id)
+            .await
+            .expect("load target")
+            .expect("target remains");
+        assert_eq!(unchanged.email, "privacy-plain@example.test");
+        assert!(unchanged.deleted_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn forget_user_by_owner_of_all_target_orgs_anonymizes() {
+        let f = fixture().await;
+        let Json(response) = forget_user(
+            State(f.state.clone()),
+            f.member_of_other_org.clone(),
+            Path(f.plain_id.clone()),
+            None,
+        )
+        .await
+        .expect("owner of every target organization may anonymize");
+        assert!(response.success);
+        let anonymized = UserStore::find_by_id(DB::Conn(&f.state.db), &f.plain_id)
+            .await
+            .expect("load target")
+            .expect("target remains");
+        assert_ne!(anonymized.email, "privacy-plain@example.test");
+        assert!(anonymized.deleted_at.is_some());
+        assert!(anonymized.password_hash.is_none());
+    }
+
+    #[tokio::test]
+    async fn forget_user_by_platform_owner_anonymizes() {
+        let f = fixture().await;
+        let Json(response) = forget_user(
+            State(f.state.clone()),
+            f.platform.clone(),
+            Path(f.plain_id.clone()),
+            None,
+        )
+        .await
+        .expect("platform owner may anonymize");
+        assert!(response.success);
+        let anonymized = UserStore::find_by_id(DB::Conn(&f.state.db), &f.plain_id)
+            .await
+            .expect("load target")
+            .expect("target remains");
+        assert_ne!(anonymized.email, "privacy-plain@example.test");
+        assert!(anonymized.deleted_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn forget_user_cross_tenant_owner_is_refused_and_preserves_target() {
+        let f = fixture().await;
+        let foreign = UserStore::create(
+            DB::Conn(&f.state.db),
+            "privacy-foreign@example.test",
+            None,
+            false,
+        )
+        .await
+        .expect("create foreign target");
+        let (beta, _) = OrganizationStore::create_with_owner(
+            DB::Conn(&f.state.db),
+            "privacy-beta",
+            "Privacy Beta",
+            &f.outsider.user.id,
+            None,
+        )
+        .await
+        .expect("create beta organization");
+        OrganizationStore::update_status(DB::Conn(&f.state.db), &beta.id, "active")
+            .await
+            .expect("activate beta");
+        MembershipStore::create(DB::Conn(&f.state.db), &beta.id, &foreign.id, "member")
+            .await
+            .expect("add foreign membership");
+
+        match forget_user(
+            State(f.state.clone()),
+            f.member_of_other_org.clone(),
+            Path(foreign.id.clone()),
+            None,
+        )
+        .await
+        {
+            Err(AppError::Forbidden(_)) => {}
+            other => panic!("expected cross-tenant forget refusal, got {other:?}"),
+        }
+        let unchanged = UserStore::find_by_id(DB::Conn(&f.state.db), &foreign.id)
+            .await
+            .expect("load foreign target")
+            .expect("foreign target remains");
+        assert_eq!(unchanged.email, "privacy-foreign@example.test");
+        assert!(unchanged.deleted_at.is_none());
+    }
+
+    #[tokio::test]
     async fn self_service_forget_requires_confirmation_payload() {
         let f = fixture().await;
         match forget_user(

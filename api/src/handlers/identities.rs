@@ -687,6 +687,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn identity_management_is_scoped_to_the_authenticated_user() {
+        let f = fixture().await;
+        let second = UserStore::create(
+            DB::Conn(&f.state.db),
+            "identities-second@example.test",
+            None,
+            false,
+        )
+        .await
+        .expect("create second user");
+        let token = f
+            .state
+            .jwt_service
+            .create_token(&second.id, &second.email, false, None, None)
+            .expect("create second token");
+        let second_auth = AuthUser {
+            claims: f
+                .state
+                .jwt_service
+                .validate_token(&token)
+                .expect("validate second token"),
+            user: second.clone(),
+            permissions: vec![],
+            ip_address: "127.0.0.1".to_string(),
+            user_agent: "identity-second-test".to_string(),
+            current_session_id: None,
+        };
+
+        add_identity(&f, "github").await;
+        add_identity(&f, "google").await;
+        IdentityStore::create(
+            DB::Conn(&f.state.db),
+            &second.id,
+            "github",
+            "second-github-uid",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("seed second user identity");
+
+        let Json(first_list) = list_identities(
+            State(f.state.clone()),
+            Some(axum::Extension(f.auth_user.clone())),
+        )
+        .await
+        .expect("list first user identities");
+        assert_eq!(first_list.len(), 2);
+        let Json(second_list) = list_identities(
+            State(f.state.clone()),
+            Some(axum::Extension(second_auth.clone())),
+        )
+        .await
+        .expect("list second user identities");
+        assert_eq!(second_list.len(), 1);
+
+        let status = unlink_identity(
+            State(f.state.clone()),
+            Path("github".to_string()),
+            Some(axum::Extension(f.auth_user.clone())),
+        )
+        .await
+        .expect("unlink first user identity");
+        assert_eq!(status, axum::http::StatusCode::NO_CONTENT);
+
+        let Json(first_after) = list_identities(
+            State(f.state.clone()),
+            Some(axum::Extension(f.auth_user.clone())),
+        )
+        .await
+        .expect("list first user identities after unlink");
+        assert_eq!(first_after.len(), 1);
+        assert_eq!(first_after[0].provider, "google");
+        assert!(
+            IdentityStore::find_by_user_and_provider(
+                DB::Conn(&f.state.db),
+                &second.id,
+                "github",
+                None,
+                None,
+            )
+            .await
+            .expect("load second identity")
+            .is_some(),
+            "unlinking the first user's identity must not affect the second user"
+        );
+    }
+
+    #[tokio::test]
     async fn unlink_removes_only_the_chosen_provider() {
         let f = fixture().await;
         add_identity(&f, "github").await;

@@ -17,7 +17,9 @@ remain in [PRODUCTION_READINESS.md](../../PRODUCTION_READINESS.md).
 Latest release evidence (`v0.8.16`): the coordinated standalone, npm, and
 container workflow completed, and the standalone and npm release-evidence
 verifiers pass. `main` and `v*` tags are now protected, and publication waits
-for approval in the `release` environment. These close part of the Phase 1 and
+for approval in the `release` environment. The first manually dispatched
+restore-qualification run succeeded for SQLite, PostgreSQL 16, and MySQL 8.4;
+the 30-consecutive-day window is open. These close part of the Phase 1 and
 Phase 4 controls; they do not shorten the elapsed evidence windows below.
 
 ## Repository-local work still open
@@ -104,7 +106,8 @@ The local workspace cannot truthfully manufacture these results:
 - SCIM interoperability with at least two independent clients;
 - real-browser and independent-authenticator WebAuthn coverage;
 - an independent security assessment, remediation, and retest with a
-  disclosure-safe public scope and status.
+  disclosure-safe public scope and status; see the
+  [assessment scope](./independent-assessment-scope.md).
 
 ## Requires elapsed evidence
 
@@ -116,7 +119,8 @@ The local workspace cannot truthfully manufacture these results:
 - two consecutive production-candidate releases without undocumented repair;
 - two independently operated reference deployments for ninety days, including
   one non-SQLite deployment and one SAML or SCIM deployment, each completing an
-  upgrade and restore drill;
+  upgrade and restore drill; see the
+  [reference deployment evidence plan](./reference-deployment-plan.md);
 - ninety days of public issue-triage and release-cadence metrics.
 
 Until the explicit `v0.9` candidate gate passes, AuthOS should remain described

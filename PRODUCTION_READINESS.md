@@ -308,8 +308,10 @@ Reviewers: Independent assessor, Security lead, Documentation maintainer
 
 ### Evidence artifacts
 
-- Independent assessment report and remediation ledger.
-- Sanitized reference-deployment scorecards and approved case studies.
+- Independent assessment report and remediation ledger, scoped using the
+  [assessment scope](./docs/readiness/independent-assessment-scope.md).
+- Sanitized reference-deployment scorecards and approved case studies, using
+  the [reference deployment evidence plan](./docs/readiness/reference-deployment-plan.md).
 - Independent reproduction links or reports.
 - Public project-health and release-cadence metrics.
 - Evidence-backed architecture comparison.

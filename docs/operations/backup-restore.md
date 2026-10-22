@@ -6,11 +6,11 @@ recovery guarantee, RPO, or RTO. The procedures below match the repository's
 current storage layout and database containers. CI runs SQLite
 snapshot/restored-runtime checks and PostgreSQL/MySQL logical dump-and-restore
 journeys on pull requests. The scheduled `Restore qualification` workflow runs
-the same three journeys daily and retains each log for 90 days. Those source
-definitions are not evidence until successful runs accumulate; the
-30-consecutive-day window, complete deployment-state coverage, and repeated
-disaster-recovery drills have not yet produced the evidence required for a
-recovery guarantee.
+the same three journeys daily and retains each log for 90 days. The first
+manually dispatched run on 2026-10-22 succeeded for all three backends. The
+30-consecutive-day window is still open, and complete deployment-state coverage
+plus repeated disaster-recovery drills have not yet produced the evidence
+required for a recovery guarantee.
 
 ## What a recoverable backup must contain
 

@@ -71,10 +71,11 @@
         "handlers::service_api::tests::subscription_lifecycle_scoped_to_the_owning_service",
         "handlers::saml::tests::certificate_route_authority_is_bound_to_the_selected_tenant_and_service",
         "handlers::saml::tests::assertion_access_and_completion_context_are_bound_to_live_tenant_state",
-        "handlers::service_provider_tokens::tests::wildcard_and_specific_permissions_are_accepted_others_refused"
+        "handlers::service_provider_tokens::tests::wildcard_and_specific_permissions_are_accepted_others_refused",
+        "handlers::api_keys::permission_route_tests::api_key_permission_combinations_are_service_scoped"
       ],
       "open_gaps": [
-        "high: API-key permission combinations and parent/child races",
+        "high: API-key parent/child races",
         "high: PostgreSQL and MySQL parity"
       ]
     },

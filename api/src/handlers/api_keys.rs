@@ -819,3 +819,518 @@ mod route_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod permission_route_tests {
+    use super::*;
+
+    use crate::audit::actor::AuditHandle;
+    use crate::billing::providers::disabled::DisabledBillingProvider;
+    use crate::crypto::sso::OAuthClient;
+    use crate::entities::{api_keys, users};
+    use crate::services::{
+        events::EventDispatcher, metrics::MfaMetricsService, risk_engine::RiskEngine,
+    };
+    use crate::store::{
+        organization_roles::OrganizationRoleStore,
+        users::{UserCreationOptions, UserStore},
+    };
+    use crate::test_support::{setup_db, test_config, test_jwt_service};
+    use moka::future::Cache;
+    use std::sync::Arc;
+
+    struct Fixture {
+        state: AppState,
+        owner: AuthUser,
+        admin: AuthUser,
+        custom_manager: AuthUser,
+        member: AuthUser,
+        outsider: AuthUser,
+        other_owner: AuthUser,
+        viewer: AuthUser,
+        manager: AuthUser,
+        alpha_slug: String,
+        alpha_service_slug: String,
+        beta_key_id: String,
+        alpha_key_id: String,
+    }
+
+    async fn seed_key(
+        db: &sea_orm::DatabaseConnection,
+        service_id: &str,
+        name: &str,
+        created_by: &str,
+    ) -> api_keys::Model {
+        ApiKeyStore::create(
+            DB::Conn(db),
+            service_id,
+            name,
+            &format!("prefix-{name}"),
+            &format!("hash-{name}"),
+            r#"["read:service"]"#,
+            created_by,
+            None,
+        )
+        .await
+        .expect("seed API key")
+    }
+
+    async fn fixture() -> Fixture {
+        let db = setup_db().await;
+        let config = test_config();
+        let jwt_service = Arc::new(test_jwt_service(&config));
+
+        let owner = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "apikey-route-owner@example.test",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create owner")
+        .0;
+        let admin = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "apikey-route-admin@example.test",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create admin")
+        .0;
+        let custom_manager = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "apikey-route-custom@example.test",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create custom manager")
+        .0;
+        let member = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "apikey-route-member@example.test",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create member")
+        .0;
+        let outsider = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "apikey-route-outsider@example.test",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create outsider")
+        .0;
+        let other_owner = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "apikey-route-other-owner@example.test",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create other owner")
+        .0;
+        let viewer = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "apikey-route-viewer@example.test",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create viewer")
+        .0;
+        let manager = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "apikey-route-manager@example.test",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create manager")
+        .0;
+
+        let (alpha, _) = OrganizationStore::create_with_owner(
+            DB::Conn(&db),
+            "apikey-route-alpha",
+            "API Key Route Alpha",
+            &owner.id,
+            Some("tier_enterprise"),
+        )
+        .await
+        .expect("create alpha");
+        let (beta, _) = OrganizationStore::create_with_owner(
+            DB::Conn(&db),
+            "apikey-route-beta",
+            "API Key Route Beta",
+            &other_owner.id,
+            Some("tier_enterprise"),
+        )
+        .await
+        .expect("create beta");
+        for org in [&alpha, &beta] {
+            OrganizationStore::update_status(DB::Conn(&db), &org.id, "active")
+                .await
+                .expect("activate organization");
+        }
+
+        MembershipStore::create(DB::Conn(&db), &alpha.id, &admin.id, "admin")
+            .await
+            .expect("add admin");
+        MembershipStore::create(DB::Conn(&db), &alpha.id, &member.id, "member")
+            .await
+            .expect("add member");
+        MembershipStore::create(DB::Conn(&db), &alpha.id, &viewer.id, "member")
+            .await
+            .expect("add viewer member");
+        MembershipStore::create(DB::Conn(&db), &alpha.id, &manager.id, "member")
+            .await
+            .expect("add manager member");
+        OrganizationRoleStore::create(
+            DB::Conn(&db),
+            "apikey-route-manager-role",
+            &alpha.id,
+            "apikey-route-manager",
+            "API Key Route Manager",
+            None,
+            serde_json::json!([CAP_SERVICES_MANAGE]),
+        )
+        .await
+        .expect("create service manager role");
+        MembershipStore::create(
+            DB::Conn(&db),
+            &alpha.id,
+            &custom_manager.id,
+            "apikey-route-manager",
+        )
+        .await
+        .expect("add custom manager");
+
+        let alpha_service = ServiceStore::create(
+            DB::Conn(&db),
+            &alpha.id,
+            "primary",
+            "Primary",
+            "web",
+            "apikey-route-alpha-client",
+        )
+        .await
+        .expect("create alpha service");
+        let beta_service = ServiceStore::create(
+            DB::Conn(&db),
+            &beta.id,
+            "beta-primary",
+            "Beta Primary",
+            "web",
+            "apikey-route-beta-client",
+        )
+        .await
+        .expect("create beta service");
+
+        PermissionsStore::grant(
+            DB::Conn(&db),
+            crate::entities::permissions::RelationTuple::user(
+                "service".to_string(),
+                alpha_service.id.clone(),
+                "viewer".to_string(),
+                viewer.id.clone(),
+            ),
+        )
+        .await
+        .expect("grant viewer");
+        PermissionsStore::grant(
+            DB::Conn(&db),
+            crate::entities::permissions::RelationTuple::user(
+                "service".to_string(),
+                alpha_service.id.clone(),
+                "manager".to_string(),
+                manager.id.clone(),
+            ),
+        )
+        .await
+        .expect("grant manager");
+
+        let alpha_key = seed_key(&db, &alpha_service.id, "alpha-key", &owner.id).await;
+        let beta_key = seed_key(&db, &beta_service.id, "beta-key", &other_owner.id).await;
+
+        let state = AppState {
+            db: db.clone(),
+            #[cfg(feature = "db_sqlite")]
+            db_writer: db.clone(),
+            oauth_client: Arc::new(OAuthClient::new(&config).expect("create oauth client")),
+            jwt_service: jwt_service.clone(),
+            base_url: config.base_url.clone(),
+            web_client_url: config.platform_dashboard_base_url.clone(),
+            full_web_client_url: config.full_web_client_base_url.clone(),
+            encryption: None,
+            email_service: None,
+            metrics_service: Arc::new(MfaMetricsService::new(db.clone())),
+            event_dispatcher: Arc::new(EventDispatcher::new(db.clone())),
+            billing_provider: Arc::new(DisabledBillingProvider::new()),
+            risk_engine: Arc::new(RiskEngine::new().expect("create risk engine")),
+            webauthn_service: None,
+            permission_cache: Cache::new(10_000),
+            user_cache: Cache::new(10_000),
+            domain_cache: Cache::new(10_000),
+            audit_actor: AuditHandle::new(db.clone()),
+            config,
+        };
+
+        let auth_user_for = |user: &users::Model| -> AuthUser {
+            let token = state
+                .jwt_service
+                .create_token(&user.id, &user.email, false, None, None)
+                .expect("create test token");
+            AuthUser {
+                claims: state
+                    .jwt_service
+                    .validate_token(&token)
+                    .expect("validate test token"),
+                user: user.clone(),
+                permissions: vec![],
+                ip_address: "127.0.0.1".to_string(),
+                user_agent: "apikey-route-test".to_string(),
+                current_session_id: None,
+            }
+        };
+        let owner_auth = auth_user_for(&owner);
+        let admin_auth = auth_user_for(&admin);
+        let custom_auth = auth_user_for(&custom_manager);
+        let member_auth = auth_user_for(&member);
+        let outsider_auth = auth_user_for(&outsider);
+        let other_owner_auth = auth_user_for(&other_owner);
+        let viewer_auth = auth_user_for(&viewer);
+        let manager_auth = auth_user_for(&manager);
+
+        Fixture {
+            state,
+            owner: owner_auth,
+            admin: admin_auth,
+            custom_manager: custom_auth,
+            member: member_auth,
+            outsider: outsider_auth,
+            other_owner: other_owner_auth,
+            viewer: viewer_auth,
+            manager: manager_auth,
+            alpha_slug: alpha.slug,
+            alpha_service_slug: alpha_service.slug,
+            beta_key_id: beta_key.id,
+            alpha_key_id: alpha_key.id,
+        }
+    }
+
+    fn create_request(name: &str, permissions: Vec<&str>) -> CreateApiKeyRequest {
+        CreateApiKeyRequest {
+            name: name.to_string(),
+            permissions: permissions.into_iter().map(str::to_string).collect(),
+            expires_in_days: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn api_key_permission_combinations_are_service_scoped() {
+        let f = fixture().await;
+
+        for auth in [f.owner.clone(), f.admin.clone(), f.custom_manager.clone()] {
+            let (status, Json(created)) = create_api_key(
+                State(f.state.clone()),
+                Path((f.alpha_slug.clone(), f.alpha_service_slug.clone())),
+                axum::Extension(auth.clone()),
+                Json(create_request(
+                    "created",
+                    vec!["read:service", "read:provider_tokens:github"],
+                )),
+            )
+            .await
+            .expect("service manager may create an API key");
+            assert_eq!(status, StatusCode::CREATED);
+            assert_eq!(created.permissions.len(), 2);
+
+            let Json(list) = list_api_keys(
+                State(f.state.clone()),
+                Path((f.alpha_slug.clone(), f.alpha_service_slug.clone())),
+                axum::Extension(auth.clone()),
+                Query(ListApiKeysQuery {
+                    limit: None,
+                    offset: None,
+                }),
+            )
+            .await
+            .expect("service manager may list API keys");
+            assert!(list.api_keys.iter().any(|key| key.id == created.id));
+
+            let Json(got) = get_api_key(
+                State(f.state.clone()),
+                Path((
+                    f.alpha_slug.clone(),
+                    f.alpha_service_slug.clone(),
+                    created.id.clone(),
+                )),
+                axum::Extension(auth.clone()),
+            )
+            .await
+            .expect("service manager may read an API key");
+            assert_eq!(got.id, created.id);
+
+            let _ = delete_api_key(
+                State(f.state.clone()),
+                Path((
+                    f.alpha_slug.clone(),
+                    f.alpha_service_slug.clone(),
+                    created.id.clone(),
+                )),
+                axum::Extension(auth),
+            )
+            .await
+            .expect("service manager may delete an API key");
+        }
+
+        // A direct viewer grant can read/list but cannot create or delete.
+        let Json(viewer_list) = list_api_keys(
+            State(f.state.clone()),
+            Path((f.alpha_slug.clone(), f.alpha_service_slug.clone())),
+            axum::Extension(f.viewer.clone()),
+            Query(ListApiKeysQuery {
+                limit: None,
+                offset: None,
+            }),
+        )
+        .await
+        .expect("direct viewer may list");
+        assert!(viewer_list
+            .api_keys
+            .iter()
+            .any(|key| key.id == f.alpha_key_id));
+        assert!(matches!(
+            create_api_key(
+                State(f.state.clone()),
+                Path((f.alpha_slug.clone(), f.alpha_service_slug.clone())),
+                axum::Extension(f.viewer.clone()),
+                Json(create_request("viewer-denied", vec!["read:service"])),
+            )
+            .await,
+            Err(AppError::Forbidden(_))
+        ));
+        assert!(matches!(
+            delete_api_key(
+                State(f.state.clone()),
+                Path((
+                    f.alpha_slug.clone(),
+                    f.alpha_service_slug.clone(),
+                    f.alpha_key_id.clone(),
+                )),
+                axum::Extension(f.viewer.clone()),
+            )
+            .await,
+            Err(AppError::Forbidden(_))
+        ));
+
+        // A direct manager grant can create and delete.
+        let (_, Json(manager_created)) = create_api_key(
+            State(f.state.clone()),
+            Path((f.alpha_slug.clone(), f.alpha_service_slug.clone())),
+            axum::Extension(f.manager.clone()),
+            Json(create_request("manager-created", vec!["read:service"])),
+        )
+        .await
+        .expect("direct manager may create");
+        let _ = delete_api_key(
+            State(f.state.clone()),
+            Path((
+                f.alpha_slug.clone(),
+                f.alpha_service_slug.clone(),
+                manager_created.id.clone(),
+            )),
+            axum::Extension(f.manager.clone()),
+        )
+        .await
+        .expect("direct manager may delete");
+
+        for auth in [f.member.clone(), f.outsider.clone(), f.other_owner.clone()] {
+            assert!(matches!(
+                create_api_key(
+                    State(f.state.clone()),
+                    Path((f.alpha_slug.clone(), f.alpha_service_slug.clone())),
+                    axum::Extension(auth),
+                    Json(create_request("denied", vec!["read:service"])),
+                )
+                .await,
+                Err(AppError::Forbidden(_))
+            ));
+        }
+
+        // Invalid permission combinations are refused; valid provider-specific
+        // permissions are accepted.
+        assert!(matches!(
+            create_api_key(
+                State(f.state.clone()),
+                Path((f.alpha_slug.clone(), f.alpha_service_slug.clone())),
+                axum::Extension(f.owner.clone()),
+                Json(create_request("invalid", vec!["admin:everything"])),
+            )
+            .await,
+            Err(AppError::BadRequest(_))
+        ));
+
+        // Cross-tenant key IDs are hidden and leave the beta key unchanged.
+        for operation in ["get", "delete"] {
+            let result = if operation == "get" {
+                get_api_key(
+                    State(f.state.clone()),
+                    Path((
+                        f.alpha_slug.clone(),
+                        f.alpha_service_slug.clone(),
+                        f.beta_key_id.clone(),
+                    )),
+                    axum::Extension(f.owner.clone()),
+                )
+                .await
+                .map(|_| ())
+                .err()
+            } else {
+                delete_api_key(
+                    State(f.state.clone()),
+                    Path((
+                        f.alpha_slug.clone(),
+                        f.alpha_service_slug.clone(),
+                        f.beta_key_id.clone(),
+                    )),
+                    axum::Extension(f.owner.clone()),
+                )
+                .await
+                .map(|_| ())
+                .err()
+            };
+            assert!(
+                matches!(result, Some(AppError::NotFound(_))),
+                "expected not found for cross-tenant API key {operation}, got {result:?}"
+            );
+        }
+        assert!(
+            ApiKeyStore::find_by_id(DB::Conn(&f.state.db), &f.beta_key_id)
+                .await
+                .expect("load beta key")
+                .is_some(),
+            "cross-tenant API key operations must preserve the beta key"
+        );
+    }
+}

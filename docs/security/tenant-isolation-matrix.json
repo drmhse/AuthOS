@@ -105,10 +105,12 @@
       "sqlite_evidence": [
         "handlers::organization_audit::tests::audit_route_authority_is_bound_to_selected_organization",
         "handlers::organization_audit::tests::audit_metadata_recursively_redacts_credentials_but_preserves_identifiers",
-        "handlers::analytics::tests::tenant_analytics_requires_live_scoped_capability_and_excludes_other_scopes"
+        "handlers::analytics::tests::tenant_analytics_requires_live_scoped_capability_and_excludes_other_scopes",
+        "handlers::analytics::route_tests::analytics_routes_require_live_scoped_capability",
+        "handlers::analytics::route_tests::analytics_date_filters_scope_responses_and_ignore_invalid_dates",
+        "handlers::organization_audit::route_tests::audit_routes_require_live_scoped_capability_and_scope_filters"
       ],
       "open_gaps": [
-        "critical: remaining audit actor/filter/export combinations and analytics date-filter response tests",
         "high: remaining PII/free-form metadata policy, null-org MFA rows, and unchanged-state/export assertions",
         "high: PostgreSQL and MySQL parity"
       ]

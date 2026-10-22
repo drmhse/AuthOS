@@ -3,6 +3,15 @@
 This file records notable user-facing and project-level changes to AuthOS. The
 project is pre-1.0; breaking changes are called out explicitly when known.
 
+## [Unreleased]
+
+### Fixed
+
+- Release finalization now polls the npm registry for up to 15 minutes before
+  making the draft public. v0.8.16 published all five packages successfully,
+  but npm's registry took several minutes to expose `@drmhse/authos-react`,
+  causing the first finalization check to fail.
+
 ## 0.8.16 - 2026-10-21
 
 ### Security

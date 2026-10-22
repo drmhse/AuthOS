@@ -1166,11 +1166,22 @@ jobs:
           ];
 
           async function main() {
+            const deadline = Date.now() + 15 * 60 * 1000;
             for (const name of packages) {
               const endpoint = `https://registry.npmjs.org/${encodeURIComponent(name)}/${encodeURIComponent(process.env.PACKAGE_VERSION)}`;
-              const response = await fetch(endpoint, { headers: { accept: 'application/json' } });
-              if (!response.ok) {
-                throw new Error(`Published npm version cannot be verified: ${name}@${process.env.PACKAGE_VERSION} (HTTP ${response.status})`);
+              let lastStatus = 0;
+              for (;;) {
+                const response = await fetch(endpoint, {
+                  headers: { accept: 'application/json' },
+                  signal: AbortSignal.timeout(30_000),
+                });
+                if (response.ok) break;
+                lastStatus = response.status;
+                if (Date.now() >= deadline) {
+                  throw new Error(`Published npm version cannot be verified: ${name}@${process.env.PACKAGE_VERSION} (HTTP ${lastStatus})`);
+                }
+                console.log(`Waiting for npm registry propagation: ${name}@${process.env.PACKAGE_VERSION} (HTTP ${lastStatus})`);
+                await new Promise((resolve) => setTimeout(resolve, 15_000));
               }
             }
           }

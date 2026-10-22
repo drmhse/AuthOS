@@ -31,7 +31,7 @@ project is pre-1.0; breaking changes are called out explicitly when known.
   export/anonymization routes across owner, member, custom-role, admin, and
   non-member actors, plus SCIM token create/list/revoke/delete across
   cross-tenant, nonexistent-ID, invalid-expiry, and suspended-parent cases.
-  The tracked critical/high matrix count is 23.
+  The tracked critical/high matrix count is 22.
 
 ### Fixed
 

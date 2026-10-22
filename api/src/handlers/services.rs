@@ -1527,3 +1527,465 @@ mod tests {
         .expect("delete non-default plan");
     }
 }
+
+#[cfg(test)]
+mod route_tests {
+    use super::*;
+
+    use crate::audit::actor::AuditHandle;
+    use crate::billing::providers::disabled::DisabledBillingProvider;
+    use crate::crypto::sso::OAuthClient;
+    use crate::entities::users;
+    use crate::error::AppError;
+    use crate::services::{
+        events::EventDispatcher, metrics::MfaMetricsService, risk_engine::RiskEngine,
+    };
+    use crate::store::{
+        memberships::MembershipStore,
+        organization_roles::OrganizationRoleStore,
+        users::{UserCreationOptions, UserStore},
+    };
+    use crate::test_support::{setup_db, test_config, test_jwt_service};
+    use moka::future::Cache;
+    use std::sync::Arc;
+
+    struct Fixture {
+        state: AppState,
+        owner: AuthUser,
+        admin: AuthUser,
+        custom_manager: AuthUser,
+        member: AuthUser,
+        outsider: AuthUser,
+        other_owner: AuthUser,
+        alpha_slug: String,
+        beta_slug: String,
+        beta_service_slug: String,
+        beta_plan_id: String,
+    }
+
+    async fn fixture() -> Fixture {
+        let db = setup_db().await;
+        let config = test_config();
+        let jwt_service = Arc::new(test_jwt_service(&config));
+
+        let owner = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "service-route-owner@example.test",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create owner")
+        .0;
+        let admin = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "service-route-admin@example.test",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create admin")
+        .0;
+        let custom_manager = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "service-route-custom@example.test",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create custom manager")
+        .0;
+        let member = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "service-route-member@example.test",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create member")
+        .0;
+        let outsider = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "service-route-outsider@example.test",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create outsider")
+        .0;
+        let other_owner = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "service-route-other-owner@example.test",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create other owner")
+        .0;
+
+        let (alpha, _) = OrganizationStore::create_with_owner(
+            DB::Conn(&db),
+            "service-route-alpha",
+            "Service Route Alpha",
+            &owner.id,
+            Some("tier_enterprise"),
+        )
+        .await
+        .expect("create alpha");
+        let (beta, _) = OrganizationStore::create_with_owner(
+            DB::Conn(&db),
+            "service-route-beta",
+            "Service Route Beta",
+            &other_owner.id,
+            Some("tier_enterprise"),
+        )
+        .await
+        .expect("create beta");
+        for org in [&alpha, &beta] {
+            OrganizationStore::update_status(DB::Conn(&db), &org.id, "active")
+                .await
+                .expect("activate organization");
+        }
+
+        MembershipStore::create(DB::Conn(&db), &alpha.id, &admin.id, "admin")
+            .await
+            .expect("add admin");
+        MembershipStore::create(DB::Conn(&db), &alpha.id, &member.id, "member")
+            .await
+            .expect("add member");
+        OrganizationRoleStore::create(
+            DB::Conn(&db),
+            "service-route-manager-role",
+            &alpha.id,
+            "service-route-manager",
+            "Service Route Manager",
+            None,
+            serde_json::json!([CAP_SERVICES_VIEW, CAP_SERVICES_CREATE, CAP_SERVICES_MANAGE]),
+        )
+        .await
+        .expect("create service manager role");
+        MembershipStore::create(
+            DB::Conn(&db),
+            &alpha.id,
+            &custom_manager.id,
+            "service-route-manager",
+        )
+        .await
+        .expect("add custom manager");
+
+        let beta_service = ServiceStore::create(
+            DB::Conn(&db),
+            &beta.id,
+            "beta-portal",
+            "Beta Portal",
+            "web",
+            "service-route-beta-client",
+        )
+        .await
+        .expect("create beta service");
+        let beta_plan_id = uuid::Uuid::new_v4().to_string();
+        PlanStore::create(
+            DB::Conn(&db),
+            &beta_plan_id,
+            &beta_service.id,
+            "Beta Plan",
+            None,
+            1999,
+            "usd",
+            "[]",
+            None,
+            false,
+            Utc::now().naive_utc(),
+        )
+        .await
+        .expect("create beta plan");
+
+        let state = AppState {
+            db: db.clone(),
+            #[cfg(feature = "db_sqlite")]
+            db_writer: db.clone(),
+            oauth_client: Arc::new(OAuthClient::new(&config).expect("create oauth client")),
+            jwt_service: jwt_service.clone(),
+            base_url: config.base_url.clone(),
+            web_client_url: config.platform_dashboard_base_url.clone(),
+            full_web_client_url: config.full_web_client_base_url.clone(),
+            encryption: None,
+            email_service: None,
+            metrics_service: Arc::new(MfaMetricsService::new(db.clone())),
+            event_dispatcher: Arc::new(EventDispatcher::new(db.clone())),
+            billing_provider: Arc::new(DisabledBillingProvider::new()),
+            risk_engine: Arc::new(RiskEngine::new().expect("create risk engine")),
+            webauthn_service: None,
+            permission_cache: Cache::new(10_000),
+            user_cache: Cache::new(10_000),
+            domain_cache: Cache::new(10_000),
+            audit_actor: AuditHandle::new(db.clone()),
+            config,
+        };
+
+        let auth_user_for = |user: &users::Model| -> AuthUser {
+            let token = state
+                .jwt_service
+                .create_token(&user.id, &user.email, false, None, None)
+                .expect("create test token");
+            AuthUser {
+                claims: state
+                    .jwt_service
+                    .validate_token(&token)
+                    .expect("validate test token"),
+                user: user.clone(),
+                permissions: vec![],
+                ip_address: "127.0.0.1".to_string(),
+                user_agent: "service-route-test".to_string(),
+                current_session_id: None,
+            }
+        };
+        let owner_auth = auth_user_for(&owner);
+        let admin_auth = auth_user_for(&admin);
+        let custom_auth = auth_user_for(&custom_manager);
+        let member_auth = auth_user_for(&member);
+        let outsider_auth = auth_user_for(&outsider);
+        let other_owner_auth = auth_user_for(&other_owner);
+
+        Fixture {
+            state,
+            owner: owner_auth,
+            admin: admin_auth,
+            custom_manager: custom_auth,
+            member: member_auth,
+            outsider: outsider_auth,
+            other_owner: other_owner_auth,
+            alpha_slug: alpha.slug,
+            beta_slug: beta.slug,
+            beta_service_slug: beta_service.slug,
+            beta_plan_id,
+        }
+    }
+
+    fn request(slug: &str, name: &str) -> CreateServiceRequest {
+        CreateServiceRequest {
+            slug: slug.to_string(),
+            name: name.to_string(),
+            service_type: "web".to_string(),
+            github_scopes: None,
+            microsoft_scopes: None,
+            google_scopes: None,
+            redirect_uris: Some(vec!["https://app.example.test/callback".to_string()]),
+            device_activation_uri: None,
+            resource_uris: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn service_routes_require_live_scoped_capability_and_are_org_scoped() {
+        let f = fixture().await;
+
+        for (auth, slug) in [
+            (f.owner.clone(), "owner-portal"),
+            (f.admin.clone(), "admin-portal"),
+            (f.custom_manager.clone(), "custom-portal"),
+        ] {
+            let Json(created) = create_service(
+                State(f.state.clone()),
+                Path(f.alpha_slug.clone()),
+                axum::Extension(auth),
+                Json(request(slug, slug)),
+            )
+            .await
+            .expect("authorized actor may create a service");
+            assert_eq!(created.service.slug, slug);
+        }
+        for auth in [f.member.clone(), f.outsider.clone(), f.other_owner.clone()] {
+            assert!(matches!(
+                create_service(
+                    State(f.state.clone()),
+                    Path(f.alpha_slug.clone()),
+                    axum::Extension(auth),
+                    Json(request("denied-portal", "Denied")),
+                )
+                .await,
+                Err(AppError::Forbidden(_))
+            ));
+        }
+
+        let Json(list) = list_organization_services(
+            State(f.state.clone()),
+            Path(f.alpha_slug.clone()),
+            axum::Extension(f.owner.clone()),
+            Query(ListServicesQuery {
+                status: None,
+                service_type: None,
+                limit: None,
+                offset: None,
+            }),
+        )
+        .await
+        .expect("owner may list alpha services");
+        assert_eq!(list.services.len(), 3);
+
+        // Cross-tenant reads and mutations are denied and leave beta intact.
+        assert!(matches!(
+            get_service(
+                State(f.state.clone()),
+                Path((f.beta_slug.clone(), f.beta_service_slug.clone())),
+                axum::Extension(f.owner.clone()),
+            )
+            .await,
+            Err(AppError::Forbidden(_))
+        ));
+        assert!(matches!(
+            update_service(
+                State(f.state.clone()),
+                Path((f.beta_slug.clone(), f.beta_service_slug.clone())),
+                axum::Extension(f.owner.clone()),
+                Json(UpdateServiceRequest {
+                    name: Some("Cross Tenant".to_string()),
+                    service_type: None,
+                    github_scopes: None,
+                    microsoft_scopes: None,
+                    google_scopes: None,
+                    redirect_uris: None,
+                    device_activation_uri: None,
+                    resource_uris: None,
+                }),
+            )
+            .await,
+            Err(AppError::Forbidden(_))
+        ));
+        assert!(matches!(
+            delete_service(
+                State(f.state.clone()),
+                Path((f.beta_slug.clone(), f.beta_service_slug.clone())),
+                axum::Extension(f.owner.clone()),
+            )
+            .await,
+            Err(AppError::Forbidden(_))
+        ));
+        let beta_after = ServiceStore::find_by_org_and_slug(
+            DB::Conn(&f.state.db),
+            &OrganizationStore::find_by_slug(DB::Conn(&f.state.db), &f.beta_slug)
+                .await
+                .expect("load beta")
+                .expect("beta exists")
+                .id,
+            &f.beta_service_slug,
+        )
+        .await
+        .expect("load beta service")
+        .expect("beta service remains");
+        assert_eq!(beta_after.name, "Beta Portal");
+    }
+
+    #[tokio::test]
+    async fn plan_routes_require_live_scoped_capability_and_are_org_scoped() {
+        let f = fixture().await;
+        let Json(created) = create_service(
+            State(f.state.clone()),
+            Path(f.alpha_slug.clone()),
+            axum::Extension(f.owner.clone()),
+            Json(request("plan-portal", "Plan Portal")),
+        )
+        .await
+        .expect("create alpha service");
+
+        for (auth, name) in [
+            (f.owner.clone(), "Owner Plan"),
+            (f.admin.clone(), "Admin Plan"),
+            (f.custom_manager.clone(), "Custom Plan"),
+        ] {
+            let Json(plan) = create_plan(
+                State(f.state.clone()),
+                Path((f.alpha_slug.clone(), created.service.slug.clone())),
+                axum::Extension(auth),
+                Json(CreatePlanRequest {
+                    name: name.to_string(),
+                    description: None,
+                    price_cents: 100,
+                    currency: "usd".to_string(),
+                    features: None,
+                    stripe_price_id: None,
+                    is_default: false,
+                }),
+            )
+            .await
+            .expect("authorized actor may create a plan");
+            assert_eq!(plan.plan.name, name);
+        }
+        for auth in [f.member.clone(), f.outsider.clone(), f.other_owner.clone()] {
+            assert!(matches!(
+                create_plan(
+                    State(f.state.clone()),
+                    Path((f.alpha_slug.clone(), created.service.slug.clone())),
+                    axum::Extension(auth),
+                    Json(CreatePlanRequest {
+                        name: "Denied Plan".to_string(),
+                        description: None,
+                        price_cents: 100,
+                        currency: "usd".to_string(),
+                        features: None,
+                        stripe_price_id: None,
+                        is_default: false,
+                    }),
+                )
+                .await,
+                Err(AppError::Forbidden(_))
+            ));
+        }
+
+        // A beta plan ID is not reachable through an alpha service.
+        assert!(matches!(
+            update_plan(
+                State(f.state.clone()),
+                Path((
+                    f.alpha_slug.clone(),
+                    created.service.slug.clone(),
+                    f.beta_plan_id.clone(),
+                )),
+                axum::Extension(f.owner.clone()),
+                Json(UpdatePlanRequest {
+                    name: Some("Cross Tenant".to_string()),
+                    description: None,
+                    price_cents: None,
+                    currency: None,
+                    features: None,
+                    stripe_price_id: None,
+                    is_default: None,
+                }),
+            )
+            .await,
+            Err(AppError::NotFound(_))
+        ));
+        assert!(matches!(
+            delete_plan(
+                State(f.state.clone()),
+                Path((
+                    f.alpha_slug.clone(),
+                    created.service.slug.clone(),
+                    f.beta_plan_id.clone(),
+                )),
+                axum::Extension(f.owner.clone()),
+            )
+            .await,
+            Err(AppError::NotFound(_))
+        ));
+        assert!(
+            PlanStore::find_by_id(DB::Conn(&f.state.db), &f.beta_plan_id)
+                .await
+                .expect("load beta plan")
+                .is_some(),
+            "cross-tenant plan mutation must preserve the beta plan"
+        );
+    }
+}

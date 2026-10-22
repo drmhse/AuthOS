@@ -685,9 +685,11 @@ mod tests {
         events::EventDispatcher, metrics::MfaMetricsService, risk_engine::RiskEngine,
     };
     use crate::store::{
+        organization_roles::OrganizationRoleStore,
         sessions::SessionStore,
         users::{UserCreationOptions, UserStore},
     };
+    use serde_json::json;
 
     use migration::{Migrator, MigratorTrait};
     use moka::future::Cache;
@@ -697,9 +699,14 @@ mod tests {
     struct OrgSwitchFixture {
         state: AppState,
         auth_user: AuthUser,
+        alpha_slug: String,
         beta_id: String,
         beta_slug: String,
         gamma_slug: String,
+        member_auth: AuthUser,
+        custom_role_auth: AuthUser,
+        admin_auth: AuthUser,
+        outsider_auth: AuthUser,
     }
 
     use crate::test_support::test_config;
@@ -771,6 +778,77 @@ mod tests {
                 .expect("activate org");
         }
 
+        let member_model = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "alpha-member@example.com",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create alpha member")
+        .0;
+        let custom_role_model = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "alpha-custom@example.com",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create custom-role user")
+        .0;
+        let admin_model = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "alpha-admin@example.com",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create alpha admin")
+        .0;
+        let outsider_model = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "alpha-outsider@example.com",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create outsider")
+        .0;
+
+        MembershipStore::create(DB::Conn(&db), &alpha.id, &member_model.id, "member")
+            .await
+            .expect("add member to alpha");
+        OrganizationRoleStore::create(
+            DB::Conn(&db),
+            "alpha-settings-manager-role",
+            &alpha.id,
+            "settings-manager",
+            "Settings Manager",
+            None,
+            json!([CAP_ORG_SETTINGS_MANAGE]),
+        )
+        .await
+        .expect("create custom settings-manager role");
+        MembershipStore::create(
+            DB::Conn(&db),
+            &alpha.id,
+            &custom_role_model.id,
+            "settings-manager",
+        )
+        .await
+        .expect("add custom-role user to alpha");
+        MembershipStore::create(DB::Conn(&db), &alpha.id, &admin_model.id, "admin")
+            .await
+            .expect("add admin to alpha");
+
         let state = AppState {
             db: db.clone(),
             #[cfg(feature = "db_sqlite")]
@@ -829,12 +907,40 @@ mod tests {
         .expect("create original session");
         auth_user.current_session_id = Some(original_session.id.clone());
 
+        let auth_user_for = |user: &users::Model| -> AuthUser {
+            let token = state
+                .jwt_service
+                .create_token(&user.id, &user.email, false, None, None)
+                .expect("create test token");
+            AuthUser {
+                claims: state
+                    .jwt_service
+                    .validate_token(&token)
+                    .expect("validate test token"),
+                user: user.clone(),
+                permissions: vec![],
+                ip_address: "127.0.0.1".to_string(),
+                user_agent: "org-core-isolation-test".to_string(),
+                current_session_id: None,
+            }
+        };
+
+        let member_auth = auth_user_for(&member_model);
+        let custom_role_auth = auth_user_for(&custom_role_model);
+        let admin_auth = auth_user_for(&admin_model);
+        let outsider_auth = auth_user_for(&outsider_model);
+
         OrgSwitchFixture {
             state,
             auth_user,
+            alpha_slug: alpha.slug,
             beta_id: beta.id,
             beta_slug: beta.slug,
             gamma_slug: gamma.slug,
+            member_auth,
+            custom_role_auth,
+            admin_auth,
+            outsider_auth,
         }
     }
 
@@ -957,6 +1063,267 @@ mod tests {
             .await,
             Err(AppError::Forbidden(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn organization_reads_require_live_membership() {
+        let f = setup_org_switch_fixture().await;
+        let alpha = OrganizationStore::find_by_slug(DB::Conn(&f.state.db), &f.alpha_slug)
+            .await
+            .expect("load alpha")
+            .expect("alpha exists");
+
+        // Owner, member, custom role, and admin can read their organization.
+        for auth in [
+            f.auth_user.clone(),
+            f.member_auth.clone(),
+            f.custom_role_auth.clone(),
+            f.admin_auth.clone(),
+        ] {
+            let Json(response) =
+                get_organization(State(f.state.clone()), auth, Path(f.alpha_slug.clone()))
+                    .await
+                    .expect("member of alpha may read");
+            assert_eq!(response.organization.id, alpha.id);
+        }
+
+        // A non-member and a member of another organization cannot read alpha
+        // or gamma through a caller-selected slug.
+        for (auth, target) in [
+            (f.outsider_auth.clone(), f.alpha_slug.clone()),
+            (f.auth_user.clone(), f.gamma_slug.clone()),
+        ] {
+            match get_organization(State(f.state.clone()), auth, Path(target)).await {
+                Err(AppError::Forbidden(_)) => {}
+                other => panic!("expected forbidden organization read, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn organization_updates_require_capability_and_preserve_denied_state() {
+        let f = setup_org_switch_fixture().await;
+        let alpha = OrganizationStore::find_by_slug(DB::Conn(&f.state.db), &f.alpha_slug)
+            .await
+            .expect("load alpha")
+            .expect("alpha exists");
+        let gamma = OrganizationStore::find_by_slug(DB::Conn(&f.state.db), &f.gamma_slug)
+            .await
+            .expect("load gamma")
+            .expect("gamma exists");
+
+        // A built-in member cannot change settings, and the denied update must
+        // leave the stored organization unchanged.
+        match update_organization(
+            State(f.state.clone()),
+            f.member_auth.clone(),
+            Path(f.alpha_slug.clone()),
+            Json(UpdateOrganizationRequest {
+                name: Some("Member Rename".to_string()),
+            }),
+        )
+        .await
+        {
+            Err(AppError::Forbidden(_)) => {}
+            other => panic!("expected member update refusal, got {other:?}"),
+        }
+        let unchanged = OrganizationStore::find_by_slug(DB::Conn(&f.state.db), &f.alpha_slug)
+            .await
+            .expect("reload alpha")
+            .expect("alpha remains");
+        assert_eq!(unchanged.name, alpha.name);
+
+        // A custom role holding only org.settings.manage can update settings.
+        let Json(updated) = update_organization(
+            State(f.state.clone()),
+            f.custom_role_auth.clone(),
+            Path(f.alpha_slug.clone()),
+            Json(UpdateOrganizationRequest {
+                name: Some("Alpha Custom Rename".to_string()),
+            }),
+        )
+        .await
+        .expect("custom settings role may update");
+        assert_eq!(updated.organization.name, "Alpha Custom Rename");
+
+        // Admin is a built-in all-capability role.
+        let Json(updated) = update_organization(
+            State(f.state.clone()),
+            f.admin_auth.clone(),
+            Path(f.alpha_slug.clone()),
+            Json(UpdateOrganizationRequest {
+                name: Some("Alpha Admin Rename".to_string()),
+            }),
+        )
+        .await
+        .expect("admin may update");
+        assert_eq!(updated.organization.name, "Alpha Admin Rename");
+
+        // Cross-organization updates are denied without changing the target.
+        match update_organization(
+            State(f.state.clone()),
+            f.auth_user.clone(),
+            Path(f.gamma_slug.clone()),
+            Json(UpdateOrganizationRequest {
+                name: Some("Cross Tenant Rename".to_string()),
+            }),
+        )
+        .await
+        {
+            Err(AppError::Forbidden(_)) => {}
+            other => panic!("expected cross-organization update refusal, got {other:?}"),
+        }
+        let gamma_unchanged = OrganizationStore::find_by_slug(DB::Conn(&f.state.db), &f.gamma_slug)
+            .await
+            .expect("reload gamma")
+            .expect("gamma remains");
+        assert_eq!(gamma_unchanged.name, gamma.name);
+    }
+
+    #[tokio::test]
+    async fn organization_delete_requires_live_owner_and_preserves_denied_state() {
+        let f = setup_org_switch_fixture().await;
+        let gamma = OrganizationStore::find_by_slug(DB::Conn(&f.state.db), &f.gamma_slug)
+            .await
+            .expect("load gamma")
+            .expect("gamma exists");
+
+        // Only the owner may delete. Every denied actor leaves alpha intact.
+        for auth in [
+            f.member_auth.clone(),
+            f.custom_role_auth.clone(),
+            f.admin_auth.clone(),
+            f.outsider_auth.clone(),
+        ] {
+            match delete_organization(State(f.state.clone()), auth, Path(f.alpha_slug.clone()))
+                .await
+            {
+                Err(AppError::Forbidden(_)) => {}
+                other => panic!("expected delete refusal, got {other:?}"),
+            }
+            assert!(
+                OrganizationStore::find_by_slug(DB::Conn(&f.state.db), &f.alpha_slug)
+                    .await
+                    .expect("reload alpha after denied delete")
+                    .is_some(),
+                "denied delete must preserve alpha"
+            );
+        }
+
+        // An owner of another organization cannot delete gamma.
+        match delete_organization(
+            State(f.state.clone()),
+            f.auth_user.clone(),
+            Path(f.gamma_slug.clone()),
+        )
+        .await
+        {
+            Err(AppError::Forbidden(_)) => {}
+            other => panic!("expected cross-organization delete refusal, got {other:?}"),
+        }
+        assert!(
+            OrganizationStore::find_by_slug(DB::Conn(&f.state.db), &f.gamma_slug)
+                .await
+                .expect("reload gamma after denied delete")
+                .is_some(),
+            "cross-organization delete must preserve gamma"
+        );
+        assert_eq!(
+            OrganizationStore::find_by_slug(DB::Conn(&f.state.db), &f.gamma_slug)
+                .await
+                .expect("reload gamma")
+                .expect("gamma remains")
+                .name,
+            gamma.name
+        );
+
+        // The live owner can delete a disposable organization. This proves the
+        // positive path without disturbing the fixture organizations used by
+        // the other assertions.
+        let (delta, _) = OrganizationStore::create_with_owner(
+            DB::Conn(&f.state.db),
+            "delta",
+            "Delta",
+            &f.auth_user.user.id,
+            Some("tier_enterprise"),
+        )
+        .await
+        .expect("create disposable organization");
+        OrganizationStore::update_status(DB::Conn(&f.state.db), &delta.id, "active")
+            .await
+            .expect("activate disposable organization");
+        let _ = delete_organization(
+            State(f.state.clone()),
+            f.auth_user.clone(),
+            Path(delta.slug.clone()),
+        )
+        .await
+        .expect("owner may delete");
+        assert!(
+            OrganizationStore::find_by_slug(DB::Conn(&f.state.db), &delta.slug)
+                .await
+                .expect("reload deleted organization")
+                .is_none(),
+            "owner delete must remove the organization"
+        );
+    }
+
+    #[tokio::test]
+    async fn organization_listing_is_derived_from_memberships() {
+        let f = setup_org_switch_fixture().await;
+        let alpha = OrganizationStore::find_by_slug(DB::Conn(&f.state.db), &f.alpha_slug)
+            .await
+            .expect("load alpha")
+            .expect("alpha exists");
+        let gamma = OrganizationStore::find_by_slug(DB::Conn(&f.state.db), &f.gamma_slug)
+            .await
+            .expect("load gamma")
+            .expect("gamma exists");
+
+        let Json(outsider_orgs) = list_user_organizations(
+            State(f.state.clone()),
+            f.outsider_auth.clone(),
+            Query(ListOrganizationsQuery {
+                page: None,
+                limit: None,
+                status: None,
+            }),
+        )
+        .await
+        .expect("list outsider organizations");
+        assert!(outsider_orgs.is_empty());
+
+        let Json(member_orgs) = list_user_organizations(
+            State(f.state.clone()),
+            f.member_auth.clone(),
+            Query(ListOrganizationsQuery {
+                page: None,
+                limit: None,
+                status: None,
+            }),
+        )
+        .await
+        .expect("list member organizations");
+        assert_eq!(member_orgs.len(), 1);
+        assert_eq!(member_orgs[0].organization.id, alpha.id);
+
+        let Json(owner_orgs) = list_user_organizations(
+            State(f.state.clone()),
+            f.auth_user.clone(),
+            Query(ListOrganizationsQuery {
+                page: None,
+                limit: None,
+                status: None,
+            }),
+        )
+        .await
+        .expect("list owner organizations");
+        let owner_org_ids: Vec<&str> = owner_orgs
+            .iter()
+            .map(|org| org.organization.id.as_str())
+            .collect();
+        assert!(owner_org_ids.contains(&alpha.id.as_str()));
+        assert!(!owner_org_ids.contains(&gamma.id.as_str()));
     }
 }
 

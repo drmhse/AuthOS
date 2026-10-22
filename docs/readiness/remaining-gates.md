@@ -1,7 +1,7 @@
 # Remaining production-readiness gates
 
 Status: canonical closure-classification summary  
-Reviewed: 2026-07-14
+Reviewed: 2026-10-22
 
 This page separates work that can be implemented in the repository from gates
 that require a protected release candidate, repository administration,
@@ -13,6 +13,12 @@ its required evidence exists.
 The detailed Phase 2 control status remains in
 [phase-2-evidence.md](./phase-2-evidence.md). The authoritative milestone rules
 remain in [PRODUCTION_READINESS.md](../../PRODUCTION_READINESS.md).
+
+Latest release evidence (`v0.8.16`): the coordinated standalone, npm, and
+container workflow completed, and the standalone and npm release-evidence
+verifiers pass. `main` and `v*` tags are now protected, and publication waits
+for approval in the `release` environment. These close part of the Phase 1 and
+Phase 4 controls; they do not shorten the elapsed evidence windows below.
 
 ## Repository-local work still open
 
@@ -75,8 +81,10 @@ The local workspace cannot truthfully manufacture these results:
 
 ## Requires repository or organizational administration
 
-- configure protected branches, required checks, review/conversation rules,
-  environment approvals, secret access, and the documented emergency bypass;
+- add a second maintainer for independent code review and document the
+  emergency bypass; protected branches, required checks, conversation
+  resolution, tag protection, and release-environment approval are now
+  configured;
 - record Product plus Security/Release approval of public claims, threat model,
   architecture, vulnerability disposition, and each release checklist;
 - configure private vulnerability intake, maintainer/on-call ownership, signing
@@ -103,7 +111,8 @@ The local workspace cannot truthfully manufacture these results:
 - twenty consecutive protected security/quality runs with negative controls
   shown to block merge;
 - thirty consecutive scheduled restore results plus two measured recovery
-  drills for every deployment mode that receives an RPO/RTO claim;
+  drills for every deployment mode that receives an RPO/RTO claim; the daily
+  workflow is configured, but the consecutive-result window has not completed;
 - two consecutive production-candidate releases without undocumented repair;
 - two independently operated reference deployments for ninety days, including
   one non-SQLite deployment and one SAML or SCIM deployment, each completing an

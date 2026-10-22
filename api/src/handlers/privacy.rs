@@ -1015,6 +1015,74 @@ mod privacy_route_tests {
     }
 
     #[tokio::test]
+    async fn shared_user_multi_org_export_and_forget_require_owner_of_every_membership() {
+        let f = fixture().await;
+        let (beta, _) = OrganizationStore::create_with_owner(
+            DB::Conn(&f.state.db),
+            "privacy-beta",
+            "Privacy Beta",
+            &f.outsider.user.id,
+            None,
+        )
+        .await
+        .expect("create beta organization");
+        OrganizationStore::update_status(DB::Conn(&f.state.db), &beta.id, "active")
+            .await
+            .expect("activate beta");
+        MembershipStore::create(DB::Conn(&f.state.db), &beta.id, &f.plain_id, "member")
+            .await
+            .expect("add shared user to beta");
+
+        // The owner of only one of the target's organizations cannot export or
+        // anonymize the shared user.
+        for auth in [f.member_of_other_org.clone(), f.outsider.clone()] {
+            assert!(matches!(
+                export_user_data(
+                    State(f.state.clone()),
+                    auth.clone(),
+                    Path(f.plain_id.clone()),
+                )
+                .await,
+                Err(AppError::Forbidden(_))
+            ));
+            assert!(matches!(
+                forget_user(State(f.state.clone()), auth, Path(f.plain_id.clone()), None,).await,
+                Err(AppError::Forbidden(_))
+            ));
+        }
+        let unchanged = UserStore::find_by_id(DB::Conn(&f.state.db), &f.plain_id)
+            .await
+            .expect("load shared target")
+            .expect("shared target remains");
+        assert_eq!(unchanged.email, "privacy-plain@example.test");
+        assert!(unchanged.deleted_at.is_none());
+
+        // A live platform owner may export and then anonymize the shared user.
+        let Json(exported) = export_user_data(
+            State(f.state.clone()),
+            f.platform.clone(),
+            Path(f.plain_id.clone()),
+        )
+        .await
+        .expect("platform owner may export shared user");
+        assert_eq!(exported.memberships.len(), 2);
+        let Json(response) = forget_user(
+            State(f.state.clone()),
+            f.platform.clone(),
+            Path(f.plain_id.clone()),
+            None,
+        )
+        .await
+        .expect("platform owner may anonymize shared user");
+        assert!(response.success);
+        let anonymized = UserStore::find_by_id(DB::Conn(&f.state.db), &f.plain_id)
+            .await
+            .expect("load anonymized shared target")
+            .expect("anonymized target remains");
+        assert!(anonymized.deleted_at.is_some());
+    }
+
+    #[tokio::test]
     async fn self_service_forget_requires_confirmation_payload() {
         let f = fixture().await;
         match forget_user(

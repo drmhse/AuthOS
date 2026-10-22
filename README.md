@@ -69,6 +69,8 @@ Project trust and community resources:
 
 - [Project status](./PROJECT_STATUS.md)
 - [Production-readiness plan](./PRODUCTION_READINESS.md)
+- [Independent assessment scope](./docs/readiness/independent-assessment-scope.md)
+- [Reference deployment evidence plan](./docs/readiness/reference-deployment-plan.md)
 - [Security threat model](./docs/security/threat-model.md)
 - [Security architecture](./docs/security/security-architecture.md)
 - [Tenant-resource inventory](./docs/security/tenant-resource-inventory.md)

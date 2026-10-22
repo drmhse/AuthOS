@@ -1325,6 +1325,90 @@ mod tests {
         assert!(owner_org_ids.contains(&alpha.id.as_str()));
         assert!(!owner_org_ids.contains(&gamma.id.as_str()));
     }
+
+    #[tokio::test]
+    async fn organization_parent_state_is_rechecked_for_pending_and_deleted_organizations() {
+        let f = setup_org_switch_fixture().await;
+
+        // Pending organizations are visible to their members for setup, but
+        // cannot be selected as an active tenant context.
+        OrganizationStore::update_status(DB::Conn(&f.state.db), &f.beta_id, "pending")
+            .await
+            .expect("mark beta pending");
+        let Json(pending) = get_organization(
+            State(f.state.clone()),
+            f.auth_user.clone(),
+            Path(f.beta_slug.clone()),
+        )
+        .await
+        .expect("member may read a pending organization");
+        assert_eq!(pending.organization.status, "pending");
+        match select_organization(
+            State(f.state.clone()),
+            f.auth_user.clone(),
+            Path(f.beta_slug.clone()),
+        )
+        .await
+        {
+            Err(AppError::Forbidden(message)) => {
+                assert!(message.contains("not active"), "{message}")
+            }
+            other => panic!("expected pending-org selection refusal, got {other:?}"),
+        }
+        let Json(list) = list_user_organizations(
+            State(f.state.clone()),
+            f.auth_user.clone(),
+            Query(ListOrganizationsQuery {
+                page: None,
+                limit: None,
+                status: None,
+            }),
+        )
+        .await
+        .expect("list pending organization");
+        assert!(list.iter().any(|org| org.organization.slug == f.beta_slug));
+
+        // Deleting an organization removes it from reads and selection.
+        let alpha = OrganizationStore::find_by_slug(DB::Conn(&f.state.db), "alpha")
+            .await
+            .expect("load alpha")
+            .expect("alpha exists");
+        OrganizationStore::delete(DB::Conn(&f.state.db), &alpha.id)
+            .await
+            .expect("delete alpha");
+        assert!(matches!(
+            get_organization(
+                State(f.state.clone()),
+                f.auth_user.clone(),
+                Path("alpha".to_string()),
+            )
+            .await,
+            Err(AppError::NotFound(_))
+        ));
+        assert!(matches!(
+            select_organization(
+                State(f.state.clone()),
+                f.auth_user.clone(),
+                Path("alpha".to_string()),
+            )
+            .await,
+            Err(AppError::NotFound(_))
+        ));
+        let Json(after_delete) = list_user_organizations(
+            State(f.state.clone()),
+            f.auth_user.clone(),
+            Query(ListOrganizationsQuery {
+                page: None,
+                limit: None,
+                status: None,
+            }),
+        )
+        .await
+        .expect("list organizations after delete");
+        assert!(!after_delete
+            .iter()
+            .any(|org| org.organization.slug == "alpha"));
+    }
 }
 
 // Risk Settings Request/Response Types

@@ -1074,3 +1074,594 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 }
+
+#[cfg(test)]
+mod route_tests {
+    use super::*;
+
+    use crate::audit::actor::AuditHandle;
+    use crate::billing::providers::disabled::DisabledBillingProvider;
+    use crate::crypto::sso::OAuthClient;
+    use crate::services::{
+        events::EventDispatcher, metrics::MfaMetricsService, risk_engine::RiskEngine,
+    };
+    use crate::store::users::{UserCreationOptions, UserStore};
+    use crate::test_support::{setup_db, test_config, test_jwt_service};
+    use moka::future::Cache;
+    use std::sync::Arc;
+
+    struct Fixture {
+        state: AppState,
+        owner: AuthUser,
+        admin: AuthUser,
+        member: AuthUser,
+        custom_manager: AuthUser,
+        outsider: AuthUser,
+        other_owner: AuthUser,
+        alpha_slug: String,
+        beta_slug: String,
+        alpha_member_id: String,
+        beta_member_id: String,
+        alpha_service_slug: String,
+        beta_service_slug: String,
+    }
+
+    async fn fixture() -> Fixture {
+        let db = setup_db().await;
+        let config = test_config();
+        let jwt_service = Arc::new(test_jwt_service(&config));
+
+        let owner = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "member-owner@example.test",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create owner")
+        .0;
+        let admin = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "member-admin@example.test",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create admin")
+        .0;
+        let member = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "member-target@example.test",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create member")
+        .0;
+        let custom_manager = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "member-custom@example.test",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create custom manager")
+        .0;
+        let outsider = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "member-outsider@example.test",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create outsider")
+        .0;
+        let other_owner = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "member-other-owner@example.test",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create other owner")
+        .0;
+        let beta_member = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "member-beta@example.test",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create beta member")
+        .0;
+
+        let (alpha, _) = OrganizationStore::create_with_owner(
+            DB::Conn(&db),
+            "members-alpha",
+            "Members Alpha",
+            &owner.id,
+            Some("tier_enterprise"),
+        )
+        .await
+        .expect("create alpha");
+        let (beta, _) = OrganizationStore::create_with_owner(
+            DB::Conn(&db),
+            "members-beta",
+            "Members Beta",
+            &other_owner.id,
+            Some("tier_enterprise"),
+        )
+        .await
+        .expect("create beta");
+        for org in [&alpha, &beta] {
+            OrganizationStore::update_status(DB::Conn(&db), &org.id, "active")
+                .await
+                .expect("activate organization");
+        }
+
+        MembershipStore::create(DB::Conn(&db), &alpha.id, &admin.id, "admin")
+            .await
+            .expect("add admin");
+        MembershipStore::create(DB::Conn(&db), &alpha.id, &member.id, "member")
+            .await
+            .expect("add member");
+        OrganizationRoleStore::create(
+            DB::Conn(&db),
+            "member-manager-role",
+            &alpha.id,
+            "member-manager",
+            "Member Manager",
+            None,
+            json!([CAP_ORG_MEMBERS_MANAGE, CAP_ORG_ROLES_MANAGE]),
+        )
+        .await
+        .expect("create member-manager role");
+        OrganizationRoleStore::create(
+            DB::Conn(&db),
+            "member-viewer-role",
+            &alpha.id,
+            "member-viewer",
+            "Member Viewer",
+            None,
+            json!([]),
+        )
+        .await
+        .expect("create member-viewer role");
+        MembershipStore::create(
+            DB::Conn(&db),
+            &alpha.id,
+            &custom_manager.id,
+            "member-manager",
+        )
+        .await
+        .expect("add custom manager");
+        MembershipStore::create(DB::Conn(&db), &beta.id, &beta_member.id, "member")
+            .await
+            .expect("add beta member");
+
+        let alpha_service = ServiceStore::create(
+            DB::Conn(&db),
+            &alpha.id,
+            "primary",
+            "Primary",
+            "web",
+            "member-alpha-client",
+        )
+        .await
+        .expect("create alpha service");
+        let beta_service = ServiceStore::create(
+            DB::Conn(&db),
+            &beta.id,
+            "beta-primary",
+            "Beta Primary",
+            "web",
+            "member-beta-client",
+        )
+        .await
+        .expect("create beta service");
+
+        let state = AppState {
+            db: db.clone(),
+            #[cfg(feature = "db_sqlite")]
+            db_writer: db.clone(),
+            oauth_client: Arc::new(OAuthClient::new(&config).expect("create oauth client")),
+            jwt_service: jwt_service.clone(),
+            base_url: config.base_url.clone(),
+            web_client_url: config.platform_dashboard_base_url.clone(),
+            full_web_client_url: config.full_web_client_base_url.clone(),
+            encryption: None,
+            email_service: None,
+            metrics_service: Arc::new(MfaMetricsService::new(db.clone())),
+            event_dispatcher: Arc::new(EventDispatcher::new(db.clone())),
+            billing_provider: Arc::new(DisabledBillingProvider::new()),
+            risk_engine: Arc::new(RiskEngine::new().expect("create risk engine")),
+            webauthn_service: None,
+            permission_cache: Cache::new(10_000),
+            user_cache: Cache::new(10_000),
+            domain_cache: Cache::new(10_000),
+            audit_actor: AuditHandle::new(db.clone()),
+            config,
+        };
+
+        let auth_user_for = |user: &users::Model| -> AuthUser {
+            let token = state
+                .jwt_service
+                .create_token(&user.id, &user.email, false, None, None)
+                .expect("create test token");
+            AuthUser {
+                claims: state
+                    .jwt_service
+                    .validate_token(&token)
+                    .expect("validate test token"),
+                user: user.clone(),
+                permissions: vec![],
+                ip_address: "127.0.0.1".to_string(),
+                user_agent: "member-route-test".to_string(),
+                current_session_id: None,
+            }
+        };
+        let owner_auth = auth_user_for(&owner);
+        let admin_auth = auth_user_for(&admin);
+        let member_auth = auth_user_for(&member);
+        let custom_auth = auth_user_for(&custom_manager);
+        let outsider_auth = auth_user_for(&outsider);
+        let other_owner_auth = auth_user_for(&other_owner);
+
+        Fixture {
+            state,
+            owner: owner_auth,
+            admin: admin_auth,
+            member: member_auth,
+            custom_manager: custom_auth,
+            outsider: outsider_auth,
+            other_owner: other_owner_auth,
+            alpha_slug: alpha.slug,
+            beta_slug: beta.slug,
+            alpha_member_id: member.id,
+            beta_member_id: beta_member.id,
+            alpha_service_slug: alpha_service.slug,
+            beta_service_slug: beta_service.slug,
+        }
+    }
+
+    #[tokio::test]
+    async fn member_listing_and_service_access_are_org_scoped() {
+        let f = fixture().await;
+
+        for auth in [
+            f.owner.clone(),
+            f.admin.clone(),
+            f.member.clone(),
+            f.custom_manager.clone(),
+        ] {
+            let Json(list) = list_members(
+                State(f.state.clone()),
+                auth,
+                Path(f.alpha_slug.clone()),
+                Query(ListMembersQuery {
+                    page: None,
+                    limit: None,
+                    role: None,
+                }),
+            )
+            .await
+            .expect("member of alpha may list members");
+            let ids: Vec<&str> = list.members.iter().map(|m| m.user.id.as_str()).collect();
+            assert!(!ids.contains(&f.beta_member_id.as_str()));
+        }
+
+        for auth in [f.outsider.clone(), f.other_owner.clone()] {
+            match list_members(
+                State(f.state.clone()),
+                auth,
+                Path(f.alpha_slug.clone()),
+                Query(ListMembersQuery {
+                    page: None,
+                    limit: None,
+                    role: None,
+                }),
+            )
+            .await
+            {
+                Err(AppError::Forbidden(_)) => {}
+                other => panic!("expected forbidden member list, got {other:?}"),
+            }
+        }
+
+        for auth in [f.owner.clone(), f.admin.clone(), f.custom_manager.clone()] {
+            let _ = list_member_service_access(
+                State(f.state.clone()),
+                auth,
+                Path((f.alpha_slug.clone(), f.alpha_member_id.clone())),
+            )
+            .await
+            .expect("member manager may list service access");
+        }
+        for auth in [f.member.clone(), f.outsider.clone()] {
+            match list_member_service_access(
+                State(f.state.clone()),
+                auth,
+                Path((f.alpha_slug.clone(), f.alpha_member_id.clone())),
+            )
+            .await
+            {
+                Err(AppError::Forbidden(_)) => {}
+                other => panic!("expected forbidden service-access list, got {other:?}"),
+            }
+        }
+
+        // A cross-tenant user ID is not a member of alpha and is hidden.
+        match list_member_service_access(
+            State(f.state.clone()),
+            f.owner.clone(),
+            Path((f.alpha_slug.clone(), f.beta_member_id.clone())),
+        )
+        .await
+        {
+            Err(AppError::NotFound(_)) => {}
+            other => panic!("expected cross-tenant service-access refusal, got {other:?}"),
+        }
+
+        // A cross-tenant service slug is not a valid grant in alpha.
+        match update_member_service_access(
+            State(f.state.clone()),
+            f.owner.clone(),
+            Path((f.alpha_slug.clone(), f.alpha_member_id.clone())),
+            Json(UpdateMemberServiceAccessRequest {
+                grants: vec![MemberServiceAccessGrant {
+                    service_slug: f.beta_service_slug.clone(),
+                    access: Some("viewer".to_string()),
+                }],
+            }),
+        )
+        .await
+        {
+            Err(AppError::NotFound(_)) => {}
+            other => panic!("expected cross-tenant service refusal, got {other:?}"),
+        }
+
+        let Json(access) = update_member_service_access(
+            State(f.state.clone()),
+            f.owner.clone(),
+            Path((f.alpha_slug.clone(), f.alpha_member_id.clone())),
+            Json(UpdateMemberServiceAccessRequest {
+                grants: vec![MemberServiceAccessGrant {
+                    service_slug: f.alpha_service_slug.clone(),
+                    access: Some("viewer".to_string()),
+                }],
+            }),
+        )
+        .await
+        .expect("owner may grant alpha service access");
+        assert!(access.iter().any(|entry| {
+            entry.service_slug == f.alpha_service_slug && entry.access.as_deref() == Some("viewer")
+        }));
+
+        // A member actor cannot grant service access.
+        match update_member_service_access(
+            State(f.state.clone()),
+            f.member.clone(),
+            Path((f.alpha_slug.clone(), f.alpha_member_id.clone())),
+            Json(UpdateMemberServiceAccessRequest {
+                grants: vec![MemberServiceAccessGrant {
+                    service_slug: f.alpha_service_slug.clone(),
+                    access: Some("manager".to_string()),
+                }],
+            }),
+        )
+        .await
+        {
+            Err(AppError::Forbidden(_)) => {}
+            other => panic!("expected member service-access refusal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn member_role_updates_require_role_management_and_preserve_denied_targets() {
+        let f = fixture().await;
+
+        for auth in [f.member.clone(), f.outsider.clone()] {
+            match update_member_role(
+                State(f.state.clone()),
+                auth,
+                Path((f.alpha_slug.clone(), f.alpha_member_id.clone())),
+                Json(UpdateMemberRoleRequest {
+                    role: "member".to_string(),
+                }),
+            )
+            .await
+            {
+                Err(AppError::Forbidden(_)) => {}
+                other => panic!("expected role-update refusal, got {other:?}"),
+            }
+        }
+
+        // Only an owner may change an existing admin or grant admin.
+        match update_member_role(
+            State(f.state.clone()),
+            f.admin.clone(),
+            Path((f.alpha_slug.clone(), f.owner.user.id.clone())),
+            Json(UpdateMemberRoleRequest {
+                role: "member".to_string(),
+            }),
+        )
+        .await
+        {
+            Err(AppError::Forbidden(_)) => {}
+            other => panic!("expected owner-target update refusal, got {other:?}"),
+        }
+        assert_eq!(
+            MembershipStore::find_by_org_and_user(
+                DB::Conn(&f.state.db),
+                &OrganizationStore::find_by_slug(DB::Conn(&f.state.db), &f.alpha_slug)
+                    .await
+                    .expect("load alpha")
+                    .expect("alpha exists")
+                    .id,
+                &f.owner.user.id,
+            )
+            .await
+            .expect("load owner membership")
+            .expect("owner membership exists")
+            .role,
+            "owner"
+        );
+
+        // A custom role with member/role management may assign a non-built-in
+        // role, but cannot mint an admin.
+        let Json(updated) = update_member_role(
+            State(f.state.clone()),
+            f.custom_manager.clone(),
+            Path((f.alpha_slug.clone(), f.alpha_member_id.clone())),
+            Json(UpdateMemberRoleRequest {
+                role: "member-viewer".to_string(),
+            }),
+        )
+        .await
+        .expect("custom manager may assign a custom role");
+        assert_eq!(updated.membership.role, "member-viewer");
+        match update_member_role(
+            State(f.state.clone()),
+            f.custom_manager.clone(),
+            Path((f.alpha_slug.clone(), f.alpha_member_id.clone())),
+            Json(UpdateMemberRoleRequest {
+                role: "admin".to_string(),
+            }),
+        )
+        .await
+        {
+            Err(AppError::Forbidden(_)) => {}
+            other => panic!("expected custom-to-admin refusal, got {other:?}"),
+        }
+
+        // Self-role changes are refused.
+        match update_member_role(
+            State(f.state.clone()),
+            f.owner.clone(),
+            Path((f.alpha_slug.clone(), f.owner.user.id.clone())),
+            Json(UpdateMemberRoleRequest {
+                role: "admin".to_string(),
+            }),
+        )
+        .await
+        {
+            Err(AppError::BadRequest(_)) => {}
+            other => panic!("expected self-role refusal, got {other:?}"),
+        }
+
+        // A cross-tenant target ID is not a member of alpha.
+        match update_member_role(
+            State(f.state.clone()),
+            f.owner.clone(),
+            Path((f.alpha_slug.clone(), f.beta_member_id.clone())),
+            Json(UpdateMemberRoleRequest {
+                role: "member".to_string(),
+            }),
+        )
+        .await
+        {
+            Err(AppError::NotFound(_)) => {}
+            other => panic!("expected cross-tenant role refusal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn member_removal_requires_manage_authority_and_preserves_denied_targets() {
+        let f = fixture().await;
+        let alpha = OrganizationStore::find_by_slug(DB::Conn(&f.state.db), &f.alpha_slug)
+            .await
+            .expect("load alpha")
+            .expect("alpha exists");
+
+        for auth in [f.member.clone(), f.outsider.clone()] {
+            match remove_member(
+                State(f.state.clone()),
+                auth,
+                Path((f.alpha_slug.clone(), f.alpha_member_id.clone())),
+            )
+            .await
+            {
+                Err(AppError::Forbidden(_)) => {}
+                other => panic!("expected removal refusal, got {other:?}"),
+            }
+        }
+
+        match remove_member(
+            State(f.state.clone()),
+            f.admin.clone(),
+            Path((f.alpha_slug.clone(), f.owner.user.id.clone())),
+        )
+        .await
+        {
+            Err(AppError::Forbidden(_)) => {}
+            other => panic!("expected admin-to-owner removal refusal, got {other:?}"),
+        }
+        assert!(
+            MembershipStore::find_by_org_and_user(
+                DB::Conn(&f.state.db),
+                &alpha.id,
+                &f.owner.user.id,
+            )
+            .await
+            .expect("load owner membership")
+            .is_some(),
+            "denied removal must preserve the owner"
+        );
+
+        match remove_member(
+            State(f.state.clone()),
+            f.owner.clone(),
+            Path((f.alpha_slug.clone(), f.beta_member_id.clone())),
+        )
+        .await
+        {
+            Err(AppError::NotFound(_)) => {}
+            other => panic!("expected cross-tenant removal refusal, got {other:?}"),
+        }
+        let beta = OrganizationStore::find_by_slug(DB::Conn(&f.state.db), &f.beta_slug)
+            .await
+            .expect("load beta")
+            .expect("beta exists");
+        assert!(
+            MembershipStore::find_by_org_and_user(
+                DB::Conn(&f.state.db),
+                &beta.id,
+                &f.beta_member_id,
+            )
+            .await
+            .expect("load beta membership")
+            .is_some(),
+            "cross-tenant removal must preserve beta membership"
+        );
+
+        let _ = remove_member(
+            State(f.state.clone()),
+            f.owner.clone(),
+            Path((f.alpha_slug.clone(), f.alpha_member_id.clone())),
+        )
+        .await
+        .expect("owner may remove a member");
+        assert!(MembershipStore::find_by_org_and_user(
+            DB::Conn(&f.state.db),
+            &alpha.id,
+            &f.alpha_member_id,
+        )
+        .await
+        .expect("load removed membership")
+        .is_none());
+    }
+}

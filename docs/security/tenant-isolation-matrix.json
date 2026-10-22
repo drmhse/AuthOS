@@ -63,10 +63,17 @@
         "store::api_keys::tests::delete_for_service_denies_cross_tenant_key_and_preserves_target",
         "store::plans::tests::plan_mutations_require_parent_service_and_preserve_other_tenant",
         "middleware::service_principal_tenant_status_tests::service_principal_authority_follows_current_organization_status",
-        "store::identities::tests::service_principal_queries_reject_inconsistent_cross_tenant_identity_context"
+        "store::identities::tests::service_principal_queries_reject_inconsistent_cross_tenant_identity_context",
+        "handlers::services::route_tests::service_routes_require_live_scoped_capability_and_are_org_scoped",
+        "handlers::services::route_tests::plan_routes_require_live_scoped_capability_and_are_org_scoped",
+        "handlers::service_api::tests::missing_permissions_are_rejected_everywhere",
+        "handlers::service_api::tests::users_can_be_listed_fetched_and_unlinked",
+        "handlers::service_api::tests::subscription_lifecycle_scoped_to_the_owning_service",
+        "handlers::saml::tests::certificate_route_authority_is_bound_to_the_selected_tenant_and_service",
+        "handlers::saml::tests::assertion_access_and_completion_context_are_bound_to_live_tenant_state",
+        "handlers::service_provider_tokens::tests::wildcard_and_specific_permissions_are_accepted_others_refused"
       ],
       "open_gaps": [
-        "critical: complete actor/permission handler matrix for services and plans, plus SAML material, subscriptions and service-principal operations",
         "high: API-key permission combinations and parent/child races",
         "high: PostgreSQL and MySQL parity"
       ]

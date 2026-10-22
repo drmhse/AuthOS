@@ -762,3 +762,373 @@ mod tests {
         audit_reconciler.shutdown().await;
     }
 }
+
+#[cfg(test)]
+mod route_tests {
+    use super::*;
+
+    use crate::audit::actor::AuditHandle;
+    use crate::billing::providers::disabled::DisabledBillingProvider;
+    use crate::crypto::sso::OAuthClient;
+    use crate::entities::{organization_audit_log, users};
+    use crate::services::{
+        events::EventDispatcher, metrics::MfaMetricsService, risk_engine::RiskEngine,
+    };
+    use crate::store::{
+        memberships::MembershipStore,
+        organization_roles::OrganizationRoleStore,
+        users::{UserCreationOptions, UserStore},
+    };
+    use crate::test_support::{setup_db, test_config, test_jwt_service};
+    use chrono::Utc;
+    use moka::future::Cache;
+    use sea_orm::{ActiveModelTrait, Set};
+    use std::sync::Arc;
+
+    struct Fixture {
+        state: AppState,
+        owner: AuthUser,
+        admin: AuthUser,
+        viewer: AuthUser,
+        member: AuthUser,
+        outsider: AuthUser,
+        other_owner: AuthUser,
+        alpha_slug: String,
+        beta_slug: String,
+        alpha_id: String,
+    }
+
+    async fn seed_audit(
+        db: &sea_orm::DatabaseConnection,
+        org_id: &str,
+        actor_id: &str,
+        action: &str,
+        target_type: &str,
+        target_id: &str,
+    ) {
+        organization_audit_log::ActiveModel {
+            id: Set(uuid::Uuid::new_v4().to_string()),
+            org_id: Set(org_id.to_string()),
+            actor_user_id: Set(actor_id.to_string()),
+            action: Set(action.to_string()),
+            target_type: Set(target_type.to_string()),
+            target_id: Set(target_id.to_string()),
+            ip_address: Set(Some("127.0.0.1".to_string())),
+            user_agent: Set(Some("audit-route-test".to_string())),
+            success: Set(true),
+            details: Set(Some("{\"secret\":\"redacted\"}".to_string())),
+            created_at: Set(Utc::now().naive_utc()),
+        }
+        .insert(db)
+        .await
+        .expect("seed audit row");
+    }
+
+    async fn fixture() -> Fixture {
+        let db = setup_db().await;
+        let config = test_config();
+        let jwt_service = Arc::new(test_jwt_service(&config));
+
+        let owner = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "audit-route-owner@example.test",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create owner")
+        .0;
+        let admin = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "audit-route-admin@example.test",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create admin")
+        .0;
+        let viewer = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "audit-route-viewer@example.test",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create viewer")
+        .0;
+        let member = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "audit-route-member@example.test",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create member")
+        .0;
+        let outsider = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "audit-route-outsider@example.test",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create outsider")
+        .0;
+        let other_owner = UserStore::find_or_create_with_options(
+            DB::Conn(&db),
+            "audit-route-other-owner@example.test",
+            UserCreationOptions {
+                mark_email_verified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create other owner")
+        .0;
+
+        let (alpha, _) = OrganizationStore::create_with_owner(
+            DB::Conn(&db),
+            "audit-route-alpha",
+            "Audit Route Alpha",
+            &owner.id,
+            Some("tier_enterprise"),
+        )
+        .await
+        .expect("create alpha");
+        let (beta, _) = OrganizationStore::create_with_owner(
+            DB::Conn(&db),
+            "audit-route-beta",
+            "Audit Route Beta",
+            &other_owner.id,
+            Some("tier_enterprise"),
+        )
+        .await
+        .expect("create beta");
+        for org in [&alpha, &beta] {
+            OrganizationStore::update_status(DB::Conn(&db), &org.id, "active")
+                .await
+                .expect("activate organization");
+        }
+
+        MembershipStore::create(DB::Conn(&db), &alpha.id, &admin.id, "admin")
+            .await
+            .expect("add admin");
+        MembershipStore::create(DB::Conn(&db), &alpha.id, &member.id, "member")
+            .await
+            .expect("add member");
+        OrganizationRoleStore::create(
+            DB::Conn(&db),
+            "audit-route-viewer-role",
+            &alpha.id,
+            "audit-route-viewer",
+            "Audit Route Viewer",
+            None,
+            serde_json::json!([CAP_AUDIT_LOGS_VIEW]),
+        )
+        .await
+        .expect("create viewer role");
+        MembershipStore::create(DB::Conn(&db), &alpha.id, &viewer.id, "audit-route-viewer")
+            .await
+            .expect("add viewer");
+
+        seed_audit(
+            &db,
+            &alpha.id,
+            &owner.id,
+            "member.added",
+            "user",
+            "shared-target-id",
+        )
+        .await;
+        seed_audit(
+            &db,
+            &alpha.id,
+            &owner.id,
+            "service.created",
+            "service",
+            "shared-target-id",
+        )
+        .await;
+        seed_audit(
+            &db,
+            &beta.id,
+            &other_owner.id,
+            "member.added",
+            "user",
+            "shared-target-id",
+        )
+        .await;
+
+        let state = AppState {
+            db: db.clone(),
+            #[cfg(feature = "db_sqlite")]
+            db_writer: db.clone(),
+            oauth_client: Arc::new(OAuthClient::new(&config).expect("create oauth client")),
+            jwt_service: jwt_service.clone(),
+            base_url: config.base_url.clone(),
+            web_client_url: config.platform_dashboard_base_url.clone(),
+            full_web_client_url: config.full_web_client_base_url.clone(),
+            encryption: None,
+            email_service: None,
+            metrics_service: Arc::new(MfaMetricsService::new(db.clone())),
+            event_dispatcher: Arc::new(EventDispatcher::new(db.clone())),
+            billing_provider: Arc::new(DisabledBillingProvider::new()),
+            risk_engine: Arc::new(RiskEngine::new().expect("create risk engine")),
+            webauthn_service: None,
+            permission_cache: Cache::new(10_000),
+            user_cache: Cache::new(10_000),
+            domain_cache: Cache::new(10_000),
+            audit_actor: AuditHandle::new(db.clone()),
+            config,
+        };
+
+        let auth_user_for = |user: &users::Model| -> AuthUser {
+            let token = state
+                .jwt_service
+                .create_token(&user.id, &user.email, false, None, None)
+                .expect("create test token");
+            AuthUser {
+                claims: state
+                    .jwt_service
+                    .validate_token(&token)
+                    .expect("validate test token"),
+                user: user.clone(),
+                permissions: vec![],
+                ip_address: "127.0.0.1".to_string(),
+                user_agent: "audit-route-test".to_string(),
+                current_session_id: None,
+            }
+        };
+        let owner_auth = auth_user_for(&owner);
+        let admin_auth = auth_user_for(&admin);
+        let viewer_auth = auth_user_for(&viewer);
+        let member_auth = auth_user_for(&member);
+        let outsider_auth = auth_user_for(&outsider);
+        let other_owner_auth = auth_user_for(&other_owner);
+
+        Fixture {
+            state,
+            owner: owner_auth,
+            admin: admin_auth,
+            viewer: viewer_auth,
+            member: member_auth,
+            outsider: outsider_auth,
+            other_owner: other_owner_auth,
+            alpha_slug: alpha.slug,
+            beta_slug: beta.slug,
+            alpha_id: alpha.id,
+        }
+    }
+
+    fn query(
+        action: Option<&str>,
+        target_type: Option<&str>,
+        target_id: Option<&str>,
+    ) -> AuditLogQuery {
+        AuditLogQuery {
+            page: None,
+            limit: None,
+            action: action.map(str::to_string),
+            target_type: target_type.map(str::to_string),
+            target_id: target_id.map(str::to_string),
+        }
+    }
+
+    #[tokio::test]
+    async fn audit_routes_require_live_scoped_capability_and_scope_filters() {
+        let f = fixture().await;
+
+        for auth in [f.owner.clone(), f.admin.clone(), f.viewer.clone()] {
+            let Json(response) = get_organization_audit_logs(
+                State(f.state.clone()),
+                auth.clone(),
+                Path(f.alpha_slug.clone()),
+                Query(query(None, None, None)),
+            )
+            .await
+            .expect("audit viewer may read logs");
+            assert_eq!(response.pagination.total, 2);
+            assert!(response.logs.iter().all(|entry| entry.org_id == f.alpha_id));
+
+            let Json(filtered) = get_organization_audit_logs(
+                State(f.state.clone()),
+                auth.clone(),
+                Path(f.alpha_slug.clone()),
+                Query(query(Some("member.added"), None, None)),
+            )
+            .await
+            .expect("action filter applies within the tenant");
+            assert_eq!(filtered.pagination.total, 1);
+            assert_eq!(filtered.logs[0].action, "member.added");
+
+            let Json(target_filtered) = get_organization_audit_logs(
+                State(f.state.clone()),
+                auth.clone(),
+                Path(f.alpha_slug.clone()),
+                Query(query(None, Some("user"), Some("shared-target-id"))),
+            )
+            .await
+            .expect("target filter applies within the tenant");
+            assert_eq!(target_filtered.pagination.total, 1);
+            assert_eq!(target_filtered.logs[0].target_type, "user");
+
+            let Json(event_types) =
+                get_audit_event_types(State(f.state.clone()), auth, Path(f.alpha_slug.clone()))
+                    .await
+                    .expect("audit viewer may read event types");
+            assert!(!event_types.is_empty());
+        }
+
+        for auth in [f.member.clone(), f.outsider.clone(), f.other_owner.clone()] {
+            assert!(matches!(
+                get_organization_audit_logs(
+                    State(f.state.clone()),
+                    auth.clone(),
+                    Path(f.alpha_slug.clone()),
+                    Query(query(None, None, None)),
+                )
+                .await,
+                Err(AppError::Forbidden(_))
+            ));
+            assert!(matches!(
+                get_audit_event_types(State(f.state.clone()), auth, Path(f.alpha_slug.clone()),)
+                    .await,
+                Err(AppError::Forbidden(_))
+            ));
+        }
+        assert!(matches!(
+            get_organization_audit_logs(
+                State(f.state.clone()),
+                f.owner.clone(),
+                Path(f.beta_slug.clone()),
+                Query(query(None, None, None)),
+            )
+            .await,
+            Err(AppError::Forbidden(_))
+        ));
+
+        OrganizationStore::update_status(DB::Conn(&f.state.db), &f.alpha_id, "suspended")
+            .await
+            .expect("suspend alpha");
+        assert!(matches!(
+            get_organization_audit_logs(
+                State(f.state.clone()),
+                f.owner.clone(),
+                Path(f.alpha_slug.clone()),
+                Query(query(None, None, None)),
+            )
+            .await,
+            Err(AppError::Forbidden(_))
+        ));
+    }
+}

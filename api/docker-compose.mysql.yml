@@ -75,7 +75,7 @@ x-common-app: &common-app
 services:
   sso:
     <<: *common-app
-    image: ${SSO_MYSQL_IMAGE:-editoredit/sso:mysql-v0.8.15}
+    image: ${SSO_MYSQL_IMAGE:-editoredit/sso:mysql-v0.8.16}
     container_name: sso-mysql
     environment:
       <<: *common-env

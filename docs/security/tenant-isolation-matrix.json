@@ -255,10 +255,18 @@
         "auth::jwt::tests::device_mfa_preauth_token_binds_exact_device_context",
         "handlers::auth::mfa::tests::device_context_requires_exact_signed_match",
         "handlers::auth::magic::tests::malformed_callback_and_suspension_after_issuance_preserve_magic_link",
-        "handlers::auth::magic::tests::same_email_and_cross_service_context_cannot_select_or_consume_wrong_identity"
+        "handlers::auth::magic::tests::same_email_and_cross_service_context_cannot_select_or_consume_wrong_identity",
+        "handlers::auth::magic::tests::magic_link_honors_enrolled_mfa",
+        "handlers::auth::password::tests::org_scoped_password_login_issues_org_claims_and_session_scope",
+        "handlers::auth::password::tests::service_scoped_password_login_issues_service_claims_and_session_scope",
+        "handlers::auth::password::tests::password_session_boundary_rechecks_deleted_user_and_service_entitlement",
+        "handlers::auth::password::tests::password_reset_is_user_bound_and_revokes_every_target_session",
+        "handlers::auth::oauth::tests::oauth_completion_reauthorizes_active_exact_tenant_service_and_registered_targets",
+        "handlers::auth::device::tests::service_device_authority_accepts_membership_or_exact_identity_and_denies_revocation",
+        "handlers::auth::device::tests::token_exchange_accepts_only_registered_resource",
+        "handlers::auth::mfa::tests::live_mfa_context_rejects_revoked_service_and_expired_device_authority"
       ],
       "open_gaps": [
-        "critical: handler-level cross-service context matrix across reset, magic-link, OAuth, device, and session flows",
         "high: distributed session/cache revocation and multi-replica one-time consumption",
         "high: PostgreSQL and MySQL parity"
       ]

@@ -68,6 +68,7 @@ npm install @drmhse/authos-cli
 Project trust and community resources:
 
 - [Project status](./PROJECT_STATUS.md)
+- [Current readiness snapshot](./docs/readiness/current-status.md)
 - [Production-readiness plan](./PRODUCTION_READINESS.md)
 - [Independent assessment scope](./docs/readiness/independent-assessment-scope.md)
 - [Reference deployment evidence plan](./docs/readiness/reference-deployment-plan.md)

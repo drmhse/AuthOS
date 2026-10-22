@@ -11,7 +11,8 @@ change and prevents implemented code from being presented as qualified before
 its required evidence exists.
 
 The detailed Phase 2 control status remains in
-[phase-2-evidence.md](./phase-2-evidence.md). The authoritative milestone rules
+[phase-2-evidence.md](./phase-2-evidence.md). The compact evidence snapshot is
+[current-status.md](./current-status.md). The authoritative milestone rules
 remain in [PRODUCTION_READINESS.md](../../PRODUCTION_READINESS.md).
 
 Latest release evidence (`v0.8.16`): the coordinated standalone, npm, and

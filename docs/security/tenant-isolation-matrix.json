@@ -226,10 +226,10 @@
         "handlers::privacy::privacy_route_tests::forget_user_by_owner_of_all_target_orgs_anonymizes",
         "handlers::privacy::privacy_route_tests::forget_user_by_platform_owner_anonymizes",
         "handlers::privacy::privacy_route_tests::forget_user_cross_tenant_owner_is_refused_and_preserves_target",
-        "handlers::identities::tests::identity_management_is_scoped_to_the_authenticated_user"
+        "handlers::identities::tests::identity_management_is_scoped_to_the_authenticated_user",
+        "handlers::privacy::privacy_route_tests::shared_user_multi_org_export_and_forget_require_owner_of_every_membership"
       ],
       "open_gaps": [
-        "high: shared-user multi-organization context tests",
         "high: PostgreSQL and MySQL parity"
       ]
     },
